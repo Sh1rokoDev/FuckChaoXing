@@ -63,6 +63,7 @@ const ConfigUI = (function () {
                 text-overflow: ellipsis; white-space: nowrap; }
       .status.ok { color: #047857; }
       .status.err { color: #dc2626; }
+      .status.warn { color: #b45309; }
     </style>
     <div class="mask">
       <div class="dlg">
@@ -237,11 +238,29 @@ const ConfigUI = (function () {
 				messages: [
 					{ role: "user", content: [{ type: "text", text: "ping，只回复 pong" }] },
 				],
-				timeout: 45000,
-				maxTokens: 16,
+				timeout: 60000,
+				// 连通性测试不需要 JSON 输出（提示词不含 "json" 会被接口拒绝），
+				// 同时给足输出预算：推理模型的思考 token 也算在里面
+				jsonMode: false,
+				maxTokens: 512,
 			});
-			const txt = String(res.text || "").slice(0, 40);
-			setStatus("连通成功：" + (txt || "(空响应)"), "ok");
+			const txt = String(res.text || "").trim();
+			if (txt) {
+				setStatus("连通成功：" + txt.slice(0, 40), "ok");
+				return;
+			}
+			// HTTP 通了但没有可见文字：多为输出预算被推理过程占用（status=incomplete）
+			const raw = res.raw || {};
+			const incomplete =
+				raw.status === "incomplete" &&
+				raw.incomplete_details &&
+				raw.incomplete_details.reason === "length";
+			setStatus(
+				incomplete
+					? "连通成功，但输出被截断（思考占用了 max tokens，可调大「max tokens」）"
+					: "连通成功，但模型未返回文字",
+				"warn",
+			);
 		} catch (e) {
 			setStatus("失败：" + ((e && e.message) || e), "err");
 		} finally {

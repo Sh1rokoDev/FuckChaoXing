@@ -134,7 +134,9 @@
 		maxJobRetries: 2, // 单个任务点重试次数上限
 		monitorInterval: 1000, // 监控轮询间隔（兜底，事件驱动为主）
 		progressLogInterval: 30000, // 播放进度日志输出间隔
-		logMaxCards: 80, // 日志区保留的最大卡片数（超出后淘汰最早的卡片）
+		logMaxCards: 220, // 日志区保留的最大卡片数（超出后淘汰最早的卡片）
+		// 说明：一次完整运行会为每个视频/作业任务点、每道题各建一张卡片，
+		// 跨多个课时容易累积到上百张，因此上限给得较宽，同时避免 DOM 无限增长。
 
 		// —— 答题相关 ——
 		workDocTimeout: 25000, // 等待题目文档就绪
@@ -1614,6 +1616,7 @@
 	                text-overflow: ellipsis; white-space: nowrap; }
 	      .status.ok { color: #047857; }
 	      .status.err { color: #dc2626; }
+	      .status.warn { color: #b45309; }
 	    </style>
 	    <div class="mask">
 	      <div class="dlg">
@@ -1788,11 +1791,29 @@
 					messages: [
 						{ role: "user", content: [{ type: "text", text: "ping，只回复 pong" }] },
 					],
-					timeout: 45000,
-					maxTokens: 16,
+					timeout: 60000,
+					// 连通性测试不需要 JSON 输出（提示词不含 "json" 会被接口拒绝），
+					// 同时给足输出预算：推理模型的思考 token 也算在里面
+					jsonMode: false,
+					maxTokens: 512,
 				});
-				const txt = String(res.text || "").slice(0, 40);
-				setStatus("连通成功：" + (txt || "(空响应)"), "ok");
+				const txt = String(res.text || "").trim();
+				if (txt) {
+					setStatus("连通成功：" + txt.slice(0, 40), "ok");
+					return;
+				}
+				// HTTP 通了但没有可见文字：多为输出预算被推理过程占用（status=incomplete）
+				const raw = res.raw || {};
+				const incomplete =
+					raw.status === "incomplete" &&
+					raw.incomplete_details &&
+					raw.incomplete_details.reason === "length";
+				setStatus(
+					incomplete
+						? "连通成功，但输出被截断（思考占用了 max tokens，可调大「max tokens」）"
+						: "连通成功，但模型未返回文字",
+					"warn",
+				);
 			} catch (e) {
 				setStatus("失败：" + ((e && e.message) || e), "err");
 			} finally {
@@ -3237,6 +3258,32 @@
 			return typeof GM_xmlhttpRequest === "function";
 		}
 
+		/**
+		 * 消息中是否出现 "json" 字样（图片内容不计）。
+		 * OpenAI 兼容接口在启用 json_object 输出格式时强制要求提示词包含该词。
+		 */
+		function messagesMentionJson(messages) {
+			return Dom.toArray(messages).some((m) => {
+				if (typeof m.content === "string") return /json/i.test(m.content);
+				return Dom.toArray(m.content).some(
+					(c) => c && c.type !== "image" && /json/i.test(c.text || ""),
+				);
+			});
+		}
+
+		/**
+		 * 判断错误是否属于「接口不支持 JSON 输出格式」。
+		 * 必须同时提到格式相关字段与不支持语义 —— 否则像 invalid_request_error
+		 * 这类通用错误类型也会被误判为不支持，导致无谓的降级重试。
+		 */
+		function isJsonFormatUnsupported(text) {
+			const t = String(text || "");
+			if (!/(json|response_?format|text\.format)/i.test(t)) return false;
+			return /unsupported|not\s+support(ed)?|does\s*not\s+support|unknown\s+(parameter|field|argument)|unrecognized|不支持/i.test(
+				t,
+			);
+		}
+
 		/** 检查请求环境；返回 { ok, fatal, reason }（fatal 表示重试无意义） */
 		function preflight(url) {
 			if (hasGM()) return { ok: true };
@@ -3368,7 +3415,7 @@
 			const style = cfg.apiStyle === "responses" ? "responses" : "chat";
 			const url = endpoint(cfg.baseUrl, style);
 			const headers = buildHeaders(cfg);
-			const wantJson = opts.jsonMode != null ? opts.jsonMode : cfg.jsonMode !== false;
+			let wantJson = opts.jsonMode != null ? opts.jsonMode : cfg.jsonMode !== false;
 			const maxTokens = opts.maxTokens || cfg.maxTokens || 2048;
 
 			// 环境预检：混合内容 / 跨域等不可恢复问题直接失败，避免无意义的重试等待
@@ -3377,6 +3424,14 @@
 				const err = new Error(pf.reason);
 				err.fatal = true;
 				throw err;
+			}
+
+			// 接口硬性要求：使用 json_object 输出格式时，提示词里必须出现 "json" 字样，
+			// 否则会直接返回 400（Prompt must contain the word 'json'）。
+			// 与其发出去被拒再降级，不如提前判断，省掉一次必然失败的请求。
+			if (wantJson && !messagesMentionJson(opts.messages)) {
+				Log.warn('提示词未包含 "json" 字样，已自动关闭 JSON 输出模式（接口限制）');
+				wantJson = false;
 			}
 
 			const body = {};
@@ -3406,13 +3461,8 @@
 						if (!data) throw new Error("响应不是合法 JSON：" + res.text.slice(0, 200));
 						return { text: pickText(data, style), raw: data };
 					}
-					// JSON 模式不被支持时降级重试一次
-					if (
-						res.status >= 400 &&
-						wantJson &&
-						/json|response_format|format/i.test(res.text) &&
-						/not support|unsupported|invalid|unrecognized|unknown/i.test(res.text)
-					) {
+					// JSON 模式确实不被接口支持时，降级为普通文本重试一次
+					if (res.status >= 400 && wantJson && isJsonFormatUnsupported(res.text)) {
 						Log.warn("接口不支持 JSON 输出模式，已自动降级为普通文本模式");
 						delete body.response_format;
 						delete body.text;
@@ -3482,7 +3532,16 @@
 			return Math.round(chars / 1024);
 		}
 
-		return { chat, extractJson, estimatePayloadKB, endpoint, hasGM, preflight };
+		return {
+			chat,
+			extractJson,
+			estimatePayloadKB,
+			endpoint,
+			hasGM,
+			preflight,
+			messagesMentionJson,
+			isJsonFormatUnsupported,
+		};
 	})();
 
 	// >>> 41-provider.js

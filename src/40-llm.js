@@ -96,6 +96,32 @@ const LLM = (function () {
 		return typeof GM_xmlhttpRequest === "function";
 	}
 
+	/**
+	 * 消息中是否出现 "json" 字样（图片内容不计）。
+	 * OpenAI 兼容接口在启用 json_object 输出格式时强制要求提示词包含该词。
+	 */
+	function messagesMentionJson(messages) {
+		return Dom.toArray(messages).some((m) => {
+			if (typeof m.content === "string") return /json/i.test(m.content);
+			return Dom.toArray(m.content).some(
+				(c) => c && c.type !== "image" && /json/i.test(c.text || ""),
+			);
+		});
+	}
+
+	/**
+	 * 判断错误是否属于「接口不支持 JSON 输出格式」。
+	 * 必须同时提到格式相关字段与不支持语义 —— 否则像 invalid_request_error
+	 * 这类通用错误类型也会被误判为不支持，导致无谓的降级重试。
+	 */
+	function isJsonFormatUnsupported(text) {
+		const t = String(text || "");
+		if (!/(json|response_?format|text\.format)/i.test(t)) return false;
+		return /unsupported|not\s+support(ed)?|does\s*not\s+support|unknown\s+(parameter|field|argument)|unrecognized|不支持/i.test(
+			t,
+		);
+	}
+
 	/** 检查请求环境；返回 { ok, fatal, reason }（fatal 表示重试无意义） */
 	function preflight(url) {
 		if (hasGM()) return { ok: true };
@@ -227,7 +253,7 @@ const LLM = (function () {
 		const style = cfg.apiStyle === "responses" ? "responses" : "chat";
 		const url = endpoint(cfg.baseUrl, style);
 		const headers = buildHeaders(cfg);
-		const wantJson = opts.jsonMode != null ? opts.jsonMode : cfg.jsonMode !== false;
+		let wantJson = opts.jsonMode != null ? opts.jsonMode : cfg.jsonMode !== false;
 		const maxTokens = opts.maxTokens || cfg.maxTokens || 2048;
 
 		// 环境预检：混合内容 / 跨域等不可恢复问题直接失败，避免无意义的重试等待
@@ -236,6 +262,14 @@ const LLM = (function () {
 			const err = new Error(pf.reason);
 			err.fatal = true;
 			throw err;
+		}
+
+		// 接口硬性要求：使用 json_object 输出格式时，提示词里必须出现 "json" 字样，
+		// 否则会直接返回 400（Prompt must contain the word 'json'）。
+		// 与其发出去被拒再降级，不如提前判断，省掉一次必然失败的请求。
+		if (wantJson && !messagesMentionJson(opts.messages)) {
+			Log.warn('提示词未包含 "json" 字样，已自动关闭 JSON 输出模式（接口限制）');
+			wantJson = false;
 		}
 
 		const body = {};
@@ -265,13 +299,8 @@ const LLM = (function () {
 					if (!data) throw new Error("响应不是合法 JSON：" + res.text.slice(0, 200));
 					return { text: pickText(data, style), raw: data };
 				}
-				// JSON 模式不被支持时降级重试一次
-				if (
-					res.status >= 400 &&
-					wantJson &&
-					/json|response_format|format/i.test(res.text) &&
-					/not support|unsupported|invalid|unrecognized|unknown/i.test(res.text)
-				) {
+				// JSON 模式确实不被接口支持时，降级为普通文本重试一次
+				if (res.status >= 400 && wantJson && isJsonFormatUnsupported(res.text)) {
 					Log.warn("接口不支持 JSON 输出模式，已自动降级为普通文本模式");
 					delete body.response_format;
 					delete body.text;
@@ -341,5 +370,14 @@ const LLM = (function () {
 		return Math.round(chars / 1024);
 	}
 
-	return { chat, extractJson, estimatePayloadKB, endpoint, hasGM, preflight };
+	return {
+		chat,
+		extractJson,
+		estimatePayloadKB,
+		endpoint,
+		hasGM,
+		preflight,
+		messagesMentionJson,
+		isJsonFormatUnsupported,
+	};
 })();
