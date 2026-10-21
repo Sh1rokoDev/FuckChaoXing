@@ -53,13 +53,18 @@ const CFG = {
 	videoFindTimeout: 25000, // 等待 video 元素出现超时
 	endedGraceTimeout: 20000, // 视频结束后等待任务点状态更新时间
 	navTimeout: 40000, // 课时切换等待超时
+	navSettleDelay: 1200, // 任务点完成后等待站点上报收尾再切课（避免请求/回调被中途掐断）
 	maxPauseResumes: 500, // 单任务点恢复播放的绝对上限（兜底；实际由进度看门狗主导）
 	noProgressTimeout: 180000, // 视频 currentTime 持续无推进的最长容忍时间（超时判失败）
+	videoPopupWait: 300000, // 视频内弹题等待手动作答的最长时间（超时判失败并跳过）
+	rateProbeDelay: 350, // 应用倍速后先给播放器留出稳定时间，再开始采样
+	rateSettleTimeout: 2600, // 播放状态下持续观察倍速是否被站点收回
+	rateReapplyLimit: 2, // 非限制性重置时允许重新应用倍速的次数（超过判定为不支持）
 	maxJobRetries: 2, // 单个任务点重试次数上限
 	monitorInterval: 1000, // 监控轮询间隔（兜底，事件驱动为主）
 	progressLogInterval: 30000, // 播放进度日志输出间隔
 	logMaxCards: 220, // 日志区保留的最大卡片数（超出后淘汰最早的卡片）
-	// 说明：一次完整运行会为每个视频/作业任务点、每道题各建一张卡片，
+	// 说明：一次完整运行会为每个课时、每道题各建一张卡片，
 	// 跨多个课时容易累积到上百张，因此上限给得较宽，同时避免 DOM 无限增长。
 
 	// —— 答题相关 ——
@@ -71,7 +76,6 @@ const CFG = {
 	renderMaxHeight: 2000, // 单张图最大高度，超出则纵向切分
 	renderTileOverlap: 24, // 切分时的重叠像素，避免切断文字
 	imageMaxWidth: 900, // 输出图片最大宽度（PNG 无损原图，不做有损压缩）
-	llmBatchSize: 1, // 每次请求提交的题目数（逐题作答，定位最清晰）
 	llmTimeout: 180000, // 单次 LLM 请求超时
 	llmMaxRetries: 3, // LLM 请求失败重试次数
 	llmRetryDelay: 2500, // LLM 重试间隔基数（指数退避）
@@ -94,6 +98,11 @@ const LLM_DEFAULTS = {
 
 /** 支持的题型（仅这三种，其余题型一律跳过） */
 const SUPPORTED_TYPES = ["单选", "多选", "判断"];
+
+/** 视频播放默认配置 */
+const VIDEO_DEFAULTS = {
+	autoRate: true, // 自动探测课程允许的最高倍速（应用后实测生效才保留，失败回退 1x）
+};
 
 /** 答题默认配置 */
 const ANSWER_DEFAULTS = {

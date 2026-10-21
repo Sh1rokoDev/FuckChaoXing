@@ -8,24 +8,17 @@ function refreshCatalog() {
 	}
 }
 
-/** 单个视频任务点：有限重试 → 仍失败则记 ERROR 跳过（不中断整体） */
-async function processVideoWithRetry(job) {
-	const cardKey = "v:" + (job.jobid || job.title);
+/** 单个视频任务点：有限重试 → 仍失败则记 ERROR 跳过（不中断整体）；返回是否完成 */
+async function processVideoWithRetry(job, cardKey) {
 	let lastErr = null;
 	for (let attempt = 1; attempt <= CFG.maxJobRetries; attempt++) {
 		if (S.stopRequested) throw STOP;
 		try {
-			Log.use(cardKey, {
-				kind: "video",
-				title: "视频任务点 · " + job.title,
-				badge: "播放中",
-				badgeCls: "run",
-			});
+			Log.use(cardKey);
 			Panel.setStatus("运行中");
 			Panel.setTask("分析视频：" + job.title);
-			const via = await handleVideoTask(job);
+			const via = await handleVideoTask(job, cardKey);
 			S.videoDone++;
-			Panel.setTaskStat();
 			Panel.setTask("当前视频任务点完成");
 			Log.use(cardKey);
 			Log.ok(
@@ -33,8 +26,7 @@ async function processVideoWithRetry(job) {
 					(via === "taskpoint" ? "学习通任务点状态" : "视频播放结束") +
 					"）",
 			);
-			Log.meta(null, "已完成", "ok");
-			return;
+			return true;
 		} catch (e) {
 			if (e === STOP) throw e;
 			lastErr = e;
@@ -52,22 +44,23 @@ async function processVideoWithRetry(job) {
 	Log.use(cardKey);
 	Panel.setStatus("异常");
 	Log.error("重试后仍未完成，跳过并继续后续任务（" + (lastErr && lastErr.message) + "）");
-	Log.meta(null, "已跳过", "err");
 	await sleep(1500); // 给用户看清日志
+	return false;
 }
 
-/** 单个答题任务点：有限重试 → 仍失败则记 ERROR 跳过 */
-async function processAnswerWithRetry(job) {
+/** 单个答题任务点：有限重试 → 仍失败则记 ERROR 跳过；返回是否完成 */
+async function processAnswerWithRetry(job, cardKey) {
 	const ansCfg = store.config("answer", ANSWER_DEFAULTS);
-	const cardKey = "job:" + (job.jobid || job.title);
+	const jobKey = cardKey || "job:" + (job.jobid || job.title);
 	let lastErr = null;
 	for (let attempt = 1; attempt <= CFG.maxJobRetries; attempt++) {
 		if (S.stopRequested) throw STOP;
 		try {
+			Log.use(jobKey);
 			Panel.setStatus("运行中");
 			Panel.setTask("分析答题：" + job.title);
-			const stat = await AnswerTask.run(job, ansCfg);
-			if (stat.status === "skipped") return;
+			const stat = await AnswerTask.run(job, ansCfg, cardKey);
+			if (stat.status === "skipped") return true;
 			if (stat.status === "aborted") {
 				// 环境/配置类问题：重试无意义，直接抛出以停止整个任务
 				throw new Error("模型请求环境不可用，已中止答题（详见日志）");
@@ -77,16 +70,12 @@ async function processAnswerWithRetry(job) {
 				throw lastErr;
 			}
 			S.answerDone++;
-			Panel.setAnswerStat();
 			Panel.setTask("当前答题任务点完成");
-			return;
+			return true;
 		} catch (e) {
 			if (e === STOP) throw e;
 			lastErr = e;
-			Log.use(cardKey, {
-				kind: "job",
-				title: "答题任务点 · " + job.title,
-			});
+			Log.use(jobKey);
 			Log.error(
 				"处理异常（第 " + attempt + "/" + CFG.maxJobRetries + " 次）：" + ((e && e.message) || e),
 			);
@@ -97,11 +86,11 @@ async function processAnswerWithRetry(job) {
 			}
 		}
 	}
-	Log.use(cardKey);
+	Log.use(jobKey);
 	Panel.setStatus("异常");
 	Log.error("重试后仍未完成，跳过并继续后续任务（" + (lastErr && lastErr.message) + "）");
-	Log.meta(null, "已跳过", "err");
 	await sleep(1500);
+	return false;
 }
 
 async function run() {
@@ -111,18 +100,21 @@ async function run() {
 	S.answerSeen = 0;
 	S.answerDone = 0;
 	S.lessonIdx = -1;
-	Panel.setTaskStat();
-	Panel.setAnswerStat();
 	Panel.setTask("准备中");
-	// 新一轮运行：清空上一轮的日志卡片，避免混淆
+	// 新一轮运行：清空上一轮的日志卡片与导航方式缓存
 	Panel.clearCards();
+	resetNavMode();
 	Log.useSystem();
 
 	const ansCfg = store.config("answer", ANSWER_DEFAULTS);
 	const llmCfg = store.config("llm", LLM_DEFAULTS);
-	if (ansCfg.enabled && (!llmCfg.apiKey || !llmCfg.model)) {
-		Log.warn("自动答题已开启但 LLM 未配置，答题任务点将被跳过（请在面板「配置…」中设置）");
+	const llmReady = !!(llmCfg.apiKey && llmCfg.model);
+	const answerEnabled = !!ansCfg.enabled && llmReady;
+	if (ansCfg.enabled && !llmReady) {
+		Log.warn("自动答题已开启但 LLM 未配置，本次将直接跳过答题任务点（请在「高级设置」中配置）");
 	}
+	// 运行期间关闭站点自身的自动连播，避免与脚本切课竞争导致页面跳转/重载
+	disableSiteAutoNext();
 
 	// ---- SCANNING：扫描课程目录 ----
 	Panel.setStatus("运行中");
@@ -139,36 +131,64 @@ async function run() {
 		Log.warn("未识别当前课时，从第一个课时开始");
 	}
 
-	// ---- 逐课时处理 ----
+	let skippedLessons = 0;
+
+	// ---- 逐课时处理（每个课时一张独立卡片） ----
 	for (let i = idx; i < S.lessons.length; i++) {
 		if (S.stopRequested) throw STOP;
 		const lesson = S.lessons[i];
 		S.lessonIdx = i;
 		Panel.setLesson(i + 1 + " / " + S.lessons.length + "　" + lesson.title);
-		Log.info("进入：" + lesson.title + "（" + (i + 1) + "/" + S.lessons.length + "）");
 
-		// 整课时已无未完成任务点（渲染快照）→ 快速跳过
+		// 整课时已无未完成任务点（渲染快照）→ 快速跳过，不建卡片避免日志刷屏
 		if (lesson.unfinished === 0) {
-			Log.skip("该课时全部任务点已完成，跳过");
+			skippedLessons++;
 			continue;
 		}
+
+		const lessonKey = "lesson:" + lesson.kid;
+		let lessonKind = ""; // video | answer | mixed
+		let lessonHadError = false;
+		let lessonJobCount = 0;
+
+		const markLessonKind = (kind) => {
+			const next = !lessonKind ? kind : lessonKind === kind ? kind : "mixed";
+			if (next === lessonKind) return;
+			lessonKind = next;
+			Log.use(lessonKey);
+			if (next === "mixed") Log.meta("课时任务", undefined, undefined, "sys");
+			else if (next === "video") Log.meta("视频任务", undefined, undefined, "video");
+			else Log.meta("答题任务", undefined, undefined, "job");
+		};
+
+		Log.use(lessonKey, {
+			kind: "video",
+			title: "课时任务",
+			badge: "进行中",
+			badgeCls: "run",
+		});
+		Log.info("进入：" + lesson.title + "（" + (i + 1) + "/" + S.lessons.length + "）");
 
 		// 页面不在该课时 → 切换
 		const active = document.querySelector("." + SEL.currentLessonActive);
 		const onLesson =
 			(active && active.id === "cur" + lesson.kid) ||
 			(cardsIframeEl() && (cardsIframeEl().src || "").indexOf("knowledgeid=" + lesson.kid) !== -1);
-		if (!onLesson) await gotoLesson(lesson);
+		if (!onLesson) {
+			await gotoLesson(lesson);
+			Log.use(lessonKey); // 导航方式首次确定时会写入系统卡片
+		}
 
 		// 该课时包含的所有卡片依次处理
 		const tabCount = document.querySelectorAll(SEL.cardTabs).length;
 		const total = Math.max(tabCount, 1);
-		let lessonJobCount = 0;
 
 		for (let n = 1; n <= total; n++) {
 			if (S.stopRequested) throw STOP;
+			Log.use(lessonKey);
 			if (n > 1) await switchCard(n, total, lesson);
 			const doc = await waitForCardsReady(lesson.kid, n - 1);
+			Log.use(lessonKey);
 
 			// ---- ANALYZE_TASKS ----
 			const jobs = scanCardJobs(doc);
@@ -182,39 +202,62 @@ async function run() {
 				if (S.stopRequested) throw STOP;
 				if (job.type === "video") {
 					S.videoSeen++;
-					Panel.setTaskStat();
+					markLessonKind("video");
 					if (job.done) {
 						S.videoDone++;
-						Panel.setTaskStat();
+						Log.use(lessonKey);
 						Log.info("视频任务点已完成，跳过：" + job.title);
 						continue;
 					}
 					lessonJobCount++;
-					await processVideoWithRetry(job);
+					if (!(await processVideoWithRetry(job, lessonKey))) lessonHadError = true;
 				} else if (job.type === "answer") {
 					S.answerSeen++;
-					Panel.setAnswerStat();
+					markLessonKind("answer");
 					if (job.done) {
 						S.answerDone++;
-						Panel.setAnswerStat();
+						Log.use(lessonKey);
 						Log.info("答题任务点已完成，跳过：" + job.title);
 						continue;
 					}
+					if (!answerEnabled) {
+						Log.use(lessonKey);
+						Log.skip(
+							"跳过答题任务点「" +
+								job.title +
+								"」（" +
+								(!ansCfg.enabled ? "自动答题已关闭" : "LLM 未配置") +
+								"）",
+						);
+						continue;
+					}
 					lessonJobCount++;
-					await processAnswerWithRetry(job);
+					if (!(await processAnswerWithRetry(job, lessonKey))) lessonHadError = true;
 				} else {
+					Log.use(lessonKey);
 					Log.skip("跳过其他任务点「" + job.title + "」（类型：" + job.type + "）");
 				}
 			}
 		}
 
+		Log.use(lessonKey);
 		if (!lessonJobCount) Log.skip("当前课时不包含待处理的任务点，跳过");
 		Log.info("课时处理完成，准备进入下一个课时");
+		Log.meta(
+			null,
+			lessonHadError ? "有异常" : lessonJobCount ? "已完成" : "已跳过",
+			lessonHadError ? "err" : lessonJobCount ? "ok" : "",
+		);
 	}
 
 	// ---- FINISHED ----
+	restoreSiteAutoNext();
+	// 正常跑完：清除续跑标记，避免下次打开学习页又自动开始
+	store.set("running", false);
 	Panel.setStatus("已完成");
 	Panel.setTask("全部完成");
+	Log.useSystem();
+	if (skippedLessons) Log.skip("跳过 " + skippedLessons + " 个已全部完成的课时");
 	Log.info(
 		"课程处理完毕：视频任务点 " +
 			S.videoDone +
@@ -246,6 +289,7 @@ const Runner = {
 			})
 			.then(() => {
 				S.running = false;
+				restoreSiteAutoNext();
 			});
 	},
 	stop() {
@@ -271,6 +315,9 @@ const Runner = {
 			}
 		});
 		S.observers = [];
+		// 停止后不再让视频继续在后台播放，并恢复站点自动连播设置
+		pauseCourseVideos();
+		restoreSiteAutoNext();
 		// 清理离屏渲染容器中的残留节点（面板保留）
 		const rh = document.getElementById("cxap-render-host");
 		if (rh) rh.innerHTML = "";

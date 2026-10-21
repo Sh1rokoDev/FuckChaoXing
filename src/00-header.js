@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通任务点自动助手（视频 + LLM 自动答题）
 // @namespace    cx-auto-assistant
-// @version      0.2.0
-// @description  自动遍历学习通课程课时：自动播放未完成的视频任务点，并调用多模态大模型自动完成测验/作业任务点（支持文字与图片题目、字体混淆还原）。带可拖动悬浮面板与实时日志。
+// @version      0.4.0
+// @description  自动遍历学习通课程课时：自动播放未完成的视频任务点（自动探测并校验最高可用倍速），并调用多模态大模型自动完成测验/作业任务点（支持文字与图片题目、字体混淆还原）。切课不刷新页面，按课时分组日志，带 WinUI3 风格可拖动 / 可收起悬浮面板。
 // @author       Copilot
 // @match        *://mooc1.chaoxing.com/mycourse/studentstudy*
 // @match        *://mooc1-ans.chaoxing.com/mycourse/studentstudy*
@@ -45,7 +45,9 @@
  *    - VideoJS: video#video_html5_api.vjs-tech，直接可用 currentTime / duration / paused / ended / play()
  *    - 进度上报: 每 ~60s GET /mooc-ans/multimedia/log/a/{cpi}/{enc}?...playingTime&duration&clipTime&objectId...
  *      响应 JSON: {"isPassed":bool,...}，isPassed:true 即服务端判定视频任务点完成（观看时长 ≥ 90%）
- *    - 限制: 未完成任务点前拖拽会被回退；倍速锁定 1x
+ *    - 限制: 未完成任务点前拖拽会被回退；倍速档位由 playbackRates / 倍速菜单给出，
+ *            但部分课程菜单可见却实际禁用（点击提示 rateTip / eryaRateTip 或强制重置为 1x），
+ *            因此开启倍速后必须实测校验，不能只看菜单是否存在
  *
  * 6. 答题页面结构（/ananas/modules/work/ → #frame_content 文档）：
  *    - 题目容器: .TiMu.newTiMu（data 属性为题目序号 0 起）

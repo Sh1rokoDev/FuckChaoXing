@@ -123,7 +123,7 @@ const AnswerTask = (function () {
 	 *       最终提交必须由用户在学习通页面上手动点击「提交」。
 	 * @returns {Promise<{status:'done'|'skipped'|'failed', total:number, filled:number, failed:number, blank:number, saved:boolean}>}
 	 */
-	async function run(job, ansCfg) {
+	async function run(job, ansCfg, cardKey) {
 		const cfg = store.config("llm", LLM_DEFAULTS);
 		if (!ansCfg.enabled) {
 			Log.skip("跳过答题任务点「" + job.title + "」（自动答题已关闭）");
@@ -138,14 +138,16 @@ const AnswerTask = (function () {
 		// A. 定位题目文档
 		const doc = await acquireDoc(job);
 
-		// 答题任务点独立一张卡片
-		const jobKey = "job:" + (job.jobid || job.title);
-		Log.use(jobKey, {
-			kind: "job",
-			title: "答题任务点 · " + job.title,
-			badge: "分析中",
-			badgeCls: "run",
-		});
+		// 答题任务点：默认独立建卡；由主流程传入课时卡片时并入课时日志
+		const jobKey = cardKey || "job:" + (job.jobid || job.title);
+		if (cardKey) Log.use(jobKey);
+		else
+			Log.use(jobKey, {
+				kind: "job",
+				title: "答题任务点 · " + job.title,
+				badge: "分析中",
+				badgeCls: "run",
+			});
 
 		// B. 解析题目
 		const all = Extract.parseAll(doc);

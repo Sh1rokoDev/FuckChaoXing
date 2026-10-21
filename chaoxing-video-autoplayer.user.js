@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通任务点自动助手（视频 + LLM 自动答题）
 // @namespace    cx-auto-assistant
-// @version      0.2.0
-// @description  自动遍历学习通课程课时：自动播放未完成的视频任务点，并调用多模态大模型自动完成测验/作业任务点（支持文字与图片题目、字体混淆还原）。带可拖动悬浮面板与实时日志。
+// @version      0.4.0
+// @description  自动遍历学习通课程课时：自动播放未完成的视频任务点（自动探测并校验最高可用倍速），并调用多模态大模型自动完成测验/作业任务点（支持文字与图片题目、字体混淆还原）。切课不刷新页面，按课时分组日志，带 WinUI3 风格可拖动 / 可收起悬浮面板。
 // @author       Copilot
 // @match        *://mooc1.chaoxing.com/mycourse/studentstudy*
 // @match        *://mooc1-ans.chaoxing.com/mycourse/studentstudy*
@@ -45,7 +45,9 @@
  *    - VideoJS: video#video_html5_api.vjs-tech，直接可用 currentTime / duration / paused / ended / play()
  *    - 进度上报: 每 ~60s GET /mooc-ans/multimedia/log/a/{cpi}/{enc}?...playingTime&duration&clipTime&objectId...
  *      响应 JSON: {"isPassed":bool,...}，isPassed:true 即服务端判定视频任务点完成（观看时长 ≥ 90%）
- *    - 限制: 未完成任务点前拖拽会被回退；倍速锁定 1x
+ *    - 限制: 未完成任务点前拖拽会被回退；倍速档位由 playbackRates / 倍速菜单给出，
+ *            但部分课程菜单可见却实际禁用（点击提示 rateTip / eryaRateTip 或强制重置为 1x），
+ *            因此开启倍速后必须实测校验，不能只看菜单是否存在
  *
  * 6. 答题页面结构（/ananas/modules/work/ → #frame_content 文档）：
  *    - 题目容器: .TiMu.newTiMu（data 属性为题目序号 0 起）
@@ -129,13 +131,18 @@
 		videoFindTimeout: 25000, // 等待 video 元素出现超时
 		endedGraceTimeout: 20000, // 视频结束后等待任务点状态更新时间
 		navTimeout: 40000, // 课时切换等待超时
+		navSettleDelay: 1200, // 任务点完成后等待站点上报收尾再切课（避免请求/回调被中途掐断）
 		maxPauseResumes: 500, // 单任务点恢复播放的绝对上限（兜底；实际由进度看门狗主导）
 		noProgressTimeout: 180000, // 视频 currentTime 持续无推进的最长容忍时间（超时判失败）
+		videoPopupWait: 300000, // 视频内弹题等待手动作答的最长时间（超时判失败并跳过）
+		rateProbeDelay: 350, // 应用倍速后先给播放器留出稳定时间，再开始采样
+		rateSettleTimeout: 2600, // 播放状态下持续观察倍速是否被站点收回
+		rateReapplyLimit: 2, // 非限制性重置时允许重新应用倍速的次数（超过判定为不支持）
 		maxJobRetries: 2, // 单个任务点重试次数上限
 		monitorInterval: 1000, // 监控轮询间隔（兜底，事件驱动为主）
 		progressLogInterval: 30000, // 播放进度日志输出间隔
 		logMaxCards: 220, // 日志区保留的最大卡片数（超出后淘汰最早的卡片）
-		// 说明：一次完整运行会为每个视频/作业任务点、每道题各建一张卡片，
+		// 说明：一次完整运行会为每个课时、每道题各建一张卡片，
 		// 跨多个课时容易累积到上百张，因此上限给得较宽，同时避免 DOM 无限增长。
 
 		// —— 答题相关 ——
@@ -147,7 +154,6 @@
 		renderMaxHeight: 2000, // 单张图最大高度，超出则纵向切分
 		renderTileOverlap: 24, // 切分时的重叠像素，避免切断文字
 		imageMaxWidth: 900, // 输出图片最大宽度（PNG 无损原图，不做有损压缩）
-		llmBatchSize: 1, // 每次请求提交的题目数（逐题作答，定位最清晰）
 		llmTimeout: 180000, // 单次 LLM 请求超时
 		llmMaxRetries: 3, // LLM 请求失败重试次数
 		llmRetryDelay: 2500, // LLM 重试间隔基数（指数退避）
@@ -170,6 +176,11 @@
 
 	/** 支持的题型（仅这三种，其余题型一律跳过） */
 	const SUPPORTED_TYPES = ["单选", "多选", "判断"];
+
+	/** 视频播放默认配置 */
+	const VIDEO_DEFAULTS = {
+		autoRate: true, // 自动探测课程允许的最高倍速（应用后实测生效才保留，失败回退 1x）
+	};
 
 	/** 答题默认配置 */
 	const ANSWER_DEFAULTS = {
@@ -268,8 +279,8 @@
 			Panel.ensureCard("sys", { kind: "sys", title: "系统信息" });
 		},
 		/** 更新当前卡片标题与徽标 */
-		meta(title, badge, badgeCls) {
-			Panel.cardMeta(this._cur, { title, badge, badgeCls });
+		meta(title, badge, badgeCls, kind) {
+			Panel.cardMeta(this._cur, { title, badge, badgeCls, kind });
 		},
 
 		push(level, msg) {
@@ -894,7 +905,7 @@
 	};
 
 	// >>> 04-panel.js
-	// ========================= 7. 悬浮控制面板（Shadow DOM 隔离） =========================
+	// ========================= 7. 悬浮控制面板（Shadow DOM 隔离，WinUI3 / Fluent 风格） =========================
 
 	const Panel = (function () {
 		let host = null,
@@ -903,161 +914,255 @@
 
 		const HTML = `
 	      <style>
-	        :host { all: initial; }
+	        :host { all: initial; color-scheme: light dark; }
 	        * { box-sizing: border-box; margin: 0; padding: 0;
-	            font-family: "Microsoft YaHei", "PingFang SC", -apple-system, sans-serif; }
-	        .panel { width: 620px; background: #fff; border-radius: 14px; overflow: hidden;
-	                 box-shadow: 0 10px 34px rgba(15,23,42,.22), 0 2px 8px rgba(15,23,42,.08);
-	                 font-size: 11.5px; color: #0f172a; position: relative; }
+	            font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+	                         "Microsoft YaHei", "PingFang SC", sans-serif; }
 
-	        /* 标题栏 */
-	        .titlebar { background: linear-gradient(120deg, #4f46e5, #6366f1 55%, #818cf8);
-	                    color: #fff; padding: 10px 13px; display: flex; align-items: center;
-	                    gap: 9px; cursor: move; user-select: none; }
-	        .titlebar .brand { width: 8px; height: 8px; border-radius: 50%; background: #a5b4fc;
-	                           box-shadow: 0 0 0 3px rgba(255,255,255,.22); flex: 0 0 auto; }
-	        .titlebar .t { font-weight: 650; font-size: 12.5px; letter-spacing: .3px; flex: 1; }
-	        .titlebar .ibtn { width: 22px; height: 22px; border-radius: 6px; display: flex;
-	                          align-items: center; justify-content: center; cursor: pointer;
-	                          font-size: 13px; line-height: 1; opacity: .9; transition: all .15s; }
-	        .titlebar .ibtn:hover { background: rgba(255,255,255,.2); opacity: 1; }
+	        .panel {
+	          --font: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+	                  "Microsoft YaHei", "PingFang SC", sans-serif;
+	          --mono: "Cascadia Mono", "Consolas", "SFMono-Regular", monospace;
+	          --bg: rgba(243, 243, 243, .90);
+	          --card: rgba(255, 255, 255, .72);
+	          --card-solid: #ffffff;
+	          --stroke: rgba(0, 0, 0, .075);
+	          --stroke-strong: rgba(0, 0, 0, .16);
+	          --text: #1b1b1b;
+	          --text-2: #5c5c5c;
+	          --text-3: #8b8b8b;
+	          --accent: #0067c0;
+	          --accent-hover: #1975c5;
+	          --accent-pressed: #005a9e;
+	          --accent-text: #ffffff;
+	          --accent-soft: rgba(0, 103, 192, .10);
+	          --accent-2: #7a5af8;
+	          --accent-2-soft: rgba(122, 90, 248, .14);
+	          --success: #0f7b0f;
+	          --warn: #9d5d00;
+	          --error: #c42b1c;
+	          --ok-soft: rgba(15, 123, 15, .12);
+	          --warn-soft: rgba(157, 93, 0, .12);
+	          --err-soft: rgba(196, 43, 28, .12);
+	          --hover: rgba(0, 0, 0, .045);
+	          --track: rgba(0, 0, 0, .10);
+	          --inset: rgba(255, 255, 255, .55);
+	          --shadow: 0 24px 64px rgba(0, 0, 0, .24), 0 2px 8px rgba(0, 0, 0, .12);
 
-	        /* 两栏布局：左控制区 + 右日志区 */
-	        .body { display: flex; align-items: stretch; height: 402px; }
-	        .col-left { width: 298px; flex: 0 0 auto; padding: 11px 12px 12px;
-	                    display: flex; flex-direction: column; border-right: 1px solid #eef2f7; }
-	        .col-right { flex: 1 1 auto; min-width: 0; padding: 11px 12px 12px;
+	          width: min(680px, calc(100vw - 20px));
+	          background: var(--bg);
+	          backdrop-filter: blur(40px) saturate(1.5);
+	          -webkit-backdrop-filter: blur(40px) saturate(1.5);
+	          border: 1px solid var(--stroke);
+	          border-radius: 8px;
+	          overflow: hidden;
+	          box-shadow: var(--shadow);
+	          color: var(--text);
+	          font-size: 12px;
+	          line-height: 1.4;
+	          position: relative;
+	          cursor: move;
+	          -webkit-font-smoothing: antialiased;
+	        }
+
+	        .panel.dragging, .panel.dragging * { cursor: grabbing !important;
+	                                             user-select: none !important; }
+
+	        /* 收起态：圆形悬浮按钮 */
+	        .fab { display: none; position: absolute; inset: 0; z-index: 3;
+	               align-items: center; justify-content: center; border: 0;
+	               border-radius: 50%; background: transparent; color: var(--accent-text);
+	               cursor: pointer; }
+	        .fab svg { width: 20px; height: 20px; display: block; margin-left: 2px; }
+	        .panel.collapsed { width: 54px; height: 54px; border-radius: 50%;
+	                           background: var(--accent); border-color: transparent;
+	                           backdrop-filter: none; -webkit-backdrop-filter: none;
+	                           box-shadow: 0 8px 24px rgba(0, 103, 192, .34),
+	                                       0 2px 6px rgba(0, 0, 0, .18);
+	                           cursor: pointer; }
+	        .panel.collapsed:hover { background: var(--accent-hover); }
+	        .panel.collapsed .shell { display: none; }
+	        .panel.collapsed .fab { display: flex; }
+
+	        /* 收起按钮（与日志标题同一水平线，带边框的方形按钮） */
+	        .collapse { position: absolute; top: 12px; right: 12px; z-index: 6;
+	                    width: 28px; height: 28px; border: 1px solid var(--stroke);
+	                    border-radius: 6px; display: flex; align-items: center;
+	                    justify-content: center; background: var(--card);
+	                    color: var(--text-2); cursor: pointer;
+	                    transition: background .12s, color .12s, border-color .12s; }
+	        .collapse:hover { background: var(--hover); border-color: var(--stroke-strong);
+	                          color: var(--text); }
+	        .collapse svg { width: 12px; height: 12px; display: block; }
+	        .shell { position: relative; transition: opacity .12s ease; }
+	        .panel.collapsing { background: var(--accent); border-color: transparent;
+	                            box-shadow: 0 8px 24px rgba(0, 103, 192, .34),
+	                                        0 2px 6px rgba(0, 0, 0, .18);
+	                            transition: background-color .18s ease, border-color .18s ease; }
+	        .panel.collapsing .shell { opacity: 0; }
+	        .panel.expanding .shell { opacity: 0; }
+	        .panel.expanding { transition: background-color .18s ease, border-color .18s ease; }
+
+	        /* 主体两栏 */
+	        .body { display: flex; align-items: stretch; height: 442px; }
+	        .col-left { width: 308px; flex: 0 0 auto; padding: 12px 12px 14px;
+	                    display: flex; flex-direction: column; gap: 10px;
+	                    border-right: 1px solid var(--stroke); overflow-y: auto;
+	                    scrollbar-width: thin; scrollbar-color: var(--stroke-strong) transparent; }
+	        .col-left::-webkit-scrollbar { width: 4px; }
+	        .col-left::-webkit-scrollbar-thumb { background: var(--stroke-strong); border-radius: 2px; }
+	        .col-left::-webkit-scrollbar-track { background: transparent; }
+	        .col-right { flex: 1 1 auto; min-width: 0; padding: 12px;
 	                     display: flex; flex-direction: column; }
 
-	        /* 状态区 */
-	        .statline { display: flex; align-items: center; gap: 7px; margin-bottom: 2px; }
-	        .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px;
-	                border-radius: 999px; font-size: 10.5px; font-weight: 650; flex: 0 0 auto; }
+	        /* 控制台卡片（状态 + 主操作） */
+	        .dock { background: var(--card); border: 1px solid var(--stroke);
+	                border-radius: 10px; overflow: hidden;
+	                box-shadow: inset 0 1px 0 var(--inset), 0 1px 2px rgba(0,0,0,.03); }
+	        .dock[data-state="p-run"] { background: linear-gradient(180deg, var(--ok-soft), var(--card) 64%); }
+	        .dock[data-state="p-wait"] { background: linear-gradient(180deg, var(--warn-soft), var(--card) 64%); }
+	        .dock[data-state="p-err"] { background: linear-gradient(180deg, var(--err-soft), var(--card) 64%); }
+	        .dock[data-state="p-done"] { background: linear-gradient(180deg, var(--accent-soft), var(--card) 64%); }
+	        .dock-top { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px;
+	                    cursor: move; user-select: none; }
+	        .statline { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
+	        .pill { display: inline-flex; align-items: center; gap: 6px; height: 22px;
+	                padding: 0 9px; border-radius: 999px; font-size: 10.5px;
+	                font-weight: 600; flex: 0 0 auto; white-space: nowrap; }
 	        .pill i { width: 6px; height: 6px; border-radius: 50%; background: currentColor;
 	                  display: block; }
-	        .p-idle { background: #f1f5f9; color: #64748b; }
-	        .p-run { background: #ecfdf5; color: #047857; }
-	        .p-wait { background: #fffbeb; color: #b45309; }
-	        .p-err { background: #fef2f2; color: #dc2626; }
-	        .p-done { background: #eef2ff; color: #4338ca; }
-	        .p-run i { animation: pulse 1.5s ease-in-out infinite; }
-	        @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
-	        .curtask { flex: 1; text-align: right; color: #94a3b8; font-size: 11px; overflow: hidden;
-	                   text-overflow: ellipsis; white-space: nowrap; }
-
-	        /* 进度 */
-	        .prog { margin-top: 7px; }
-	        .prow { display: flex; align-items: center; gap: 7px; margin: 5px 0; }
-	        .prow .lbl { color: #64748b; font-size: 11px; width: 62px; flex: 0 0 auto; }
-	        .bar { flex: 1; height: 4px; border-radius: 999px; background: #eef2f7; overflow: hidden; }
-	        .bar span { display: block; height: 100%; width: 0%; border-radius: 999px;
-	                    transition: width .3s ease; }
-	        .bar.v span { background: linear-gradient(90deg, #34d399, #10b981); }
-	        .bar.a span { background: linear-gradient(90deg, #818cf8, #6366f1); }
-	        .cnt { font-variant-numeric: tabular-nums; color: #475569; font-weight: 650;
-	               font-size: 10.5px; width: 46px; text-align: right; flex: 0 0 auto; }
-	        .lesson { margin-top: 6px; color: #94a3b8; font-size: 10.5px; overflow: hidden;
-	                  text-overflow: ellipsis; white-space: nowrap; }
+	        .p-idle { background: var(--track); color: var(--text-2); }
+	        .p-run { background: var(--ok-soft); color: var(--success); }
+	        .p-wait { background: var(--warn-soft); color: var(--warn); }
+	        .p-err { background: var(--err-soft); color: var(--error); }
+	        .p-done { background: var(--accent-soft); color: var(--accent); }
+	        .p-run i { animation: pulse 1.6s ease-in-out infinite; }
+	        @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .28 } }
+	        .curtask { flex: 1 1 auto; min-width: 0; text-align: right; font-size: 10.5px;
+	                   color: var(--text-3); overflow: hidden; text-overflow: ellipsis;
+	                   white-space: nowrap; }
 
 	        /* 主按钮 */
-	        .mainbtn { width: 100%; margin-top: 9px; padding: 8px 0; border: 0; border-radius: 9px;
-	                   cursor: pointer; font-size: 12.5px; font-weight: 650; color: #fff;
-	                   letter-spacing: .3px; transition: all .18s; }
-	        .mainbtn.start { background: linear-gradient(120deg, #4f46e5, #6366f1);
-	                         box-shadow: 0 4px 14px rgba(79,70,229,.32); }
-	        .mainbtn.start:hover { filter: brightness(1.06); }
-	        .mainbtn.stop { background: linear-gradient(120deg, #ef4444, #f87171);
-	                        box-shadow: 0 4px 14px rgba(239,68,68,.3); }
-	        .mainbtn.stop:hover { filter: brightness(1.06); }
+	        .mainbtn { width: 100%; height: 36px; border: 0; border-radius: 4px;
+	                   cursor: pointer; font-size: 12.5px; font-weight: 600;
+	                   font-family: var(--font); letter-spacing: .2px;
+	                   transition: background .12s, transform .06s, box-shadow .12s;
+	                   background: var(--accent); color: var(--accent-text);
+	                   box-shadow: 0 2px 6px rgba(0, 103, 192, .26); }
+	        .mainbtn:hover { background: var(--accent-hover); }
+	        .mainbtn:active { background: var(--accent-pressed); transform: translateY(1px); }
+	        .mainbtn.stop { background: var(--error); color: #fff;
+	                        box-shadow: 0 2px 6px rgba(196, 43, 28, .26); }
+	        .mainbtn.stop:hover { filter: brightness(1.08); }
+	        .mainbtn:focus-visible, .collapse:focus-visible {
+	          outline: 2px solid var(--accent); outline-offset: 1px; }
 
-	        /* 设置区 */
-	        .sect { display: flex; align-items: center; gap: 6px;
-	                margin: 10px 0 6px; }
-	        .sect .st { font-weight: 650; color: #334155; font-size: 11.5px;
-	                    display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
-	        .sect .st::before { content: ""; width: 3px; height: 11px; border-radius: 2px;
-	                            background: #4f46e5; }
-	        .sect .lnk { color: #4f46e5; cursor: pointer; font-size: 11px; font-weight: 600;
-	                     flex: 0 0 auto; }
-	        .sect .lnk:hover { text-decoration: underline; }
-	        .sect .llmname { flex: 1 1 auto; min-width: 0; overflow: hidden;
-	                         text-overflow: ellipsis; white-space: nowrap;
-	                         color: #94a3b8; font-size: 11px; text-align: right; }
-	        .sect .spacer { flex: 1 1 auto; }
-	        .tag { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 10px;
-	               line-height: 15px; background: #eef2ff; color: #4338ca; font-weight: 600; }
-	        .tag.warn { background: #fef2f2; color: #dc2626; }
+	        /* 分区标题 */
+	        .sect { display: flex; align-items: center; gap: 7px; min-height: 18px; }
+	        .sect .st { flex: 0 0 auto; font-size: 11.5px; font-weight: 600;
+	                    color: var(--text); display: flex; align-items: center; }
+	        .sect .st::before { content: ""; width: 3px; height: 12px; border-radius: 2px;
+	                            background: var(--accent); margin-right: 7px; }
 
-	        /* 开关 */
-	        .switches { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
-	        .sw { display: flex; align-items: center; justify-content: space-between; gap: 7px;
-	              cursor: pointer; user-select: none; color: #475569; font-size: 11px;
-	              padding: 1px 0; }
+	        /* 操作区 */
+	        .dock-actions { display: flex; align-items: stretch; gap: 8px;
+	                        padding: 0 10px 10px; }
+	        .dock-actions .mainbtn { flex: 1 1 auto; width: auto; }
+	        .iconbtn { position: relative; width: 36px; height: 36px; flex: 0 0 auto;
+	                   display: flex; align-items: center; justify-content: center;
+	                   border: 1px solid var(--stroke-strong); border-radius: 4px;
+	                   background: var(--card); color: var(--text-2); cursor: pointer;
+	                   transition: background .12s, color .12s, border-color .12s; }
+	        .iconbtn:hover { background: var(--hover); color: var(--text); }
+	        .iconbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+	        .iconbtn svg { width: 17px; height: 17px; display: block; }
+	        .iconbtn .dot { position: absolute; top: 6px; right: 6px; width: 6px; height: 6px;
+	                        border-radius: 50%; background: var(--error);
+	                        box-shadow: 0 0 0 2px var(--card); }
+	        .iconbtn .dot.ok { background: var(--success); }
+
+	        /* 开关（WinUI 设置卡片） */
+	        .switches { display: flex; flex-direction: column; overflow: hidden;
+	                    flex: 1 1 auto;
+	                    background: var(--card); border: 1px solid var(--stroke);
+	                    border-radius: 8px; box-shadow: inset 0 1px 0 var(--inset); }
+	        .sw { display: flex; align-items: center; gap: 9px;
+	              flex: 1 1 0; min-height: 38px; padding: 0 12px;
+	              cursor: pointer; user-select: none; color: var(--text-2);
+	              font-size: 11px; transition: background .12s, color .12s; }
+	        .sw + .sw { border-top: 1px solid var(--stroke); }
+	        .sw:hover { background: var(--hover); color: var(--text); }
+	        .sw .swlead { width: 24px; height: 24px; border-radius: 6px; flex: 0 0 auto;
+	                      display: flex; align-items: center; justify-content: center;
+	                      background: var(--track); color: var(--text-2); }
+	        .sw:hover .swlead { color: var(--accent); }
+	        .sw .swlead svg { width: 14px; height: 14px; display: block; }
+	        .sw .swlabel { flex: 1 1 auto; min-width: 0; }
 	        .sw input { position: absolute; opacity: 0; pointer-events: none; }
-	        .sw .track { width: 29px; height: 16px; border-radius: 999px; background: #e2e8f0;
-	                     flex: 0 0 auto; position: relative; transition: background .2s; }
-	        .sw .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px;
-	                            height: 12px; border-radius: 50%; background: #fff;
-	                            box-shadow: 0 1px 3px rgba(15,23,42,.28); transition: transform .2s; }
-	        .sw input:checked + .track { background: #4f46e5; }
-	        .sw input:checked + .track::after { transform: translateX(13px); }
-	        .sw:hover .track { filter: brightness(.97); }
+	        .sw .track { width: 40px; height: 20px; border-radius: 10px; flex: 0 0 auto;
+	                     position: relative; background: transparent;
+	                     border: 1px solid var(--stroke-strong);
+	                     transition: background .15s, border-color .15s; }
+	        .sw .track::after { content: ""; position: absolute; top: 3px; left: 3px;
+	                            width: 12px; height: 12px; border-radius: 50%;
+	                            background: var(--text-2);
+	                            transition: transform .15s cubic-bezier(.2,0,0,1),
+	                                        background .15s; }
+	        .sw input:checked + .track { background: var(--accent); border-color: var(--accent); }
+	        .sw input:checked + .track::after { transform: translateX(20px);
+	                                            background: var(--accent-text); }
+	        .sw input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-	        /* 题型 chip */
-	        .chips { display: flex; gap: 6px; flex-wrap: wrap; }
-	        .chip { padding: 3px 10px; border-radius: 999px; border: 1px solid #e2e8f0;
-	                background: #f8fafc; color: #64748b; font-size: 11px; cursor: pointer;
-	                user-select: none; transition: all .15s; font-weight: 500; }
-	        .chip:hover { border-color: #c7d2fe; color: #4f46e5; }
-	        .chip.on { background: #4f46e5; border-color: #4f46e5; color: #fff;
-	                   box-shadow: 0 2px 8px rgba(79,70,229,.28); font-weight: 600; }
-	        .chip.dim { opacity: .45; cursor: not-allowed; }
-
-	        /* 日志（卡片流） */
+	        /* 日志 */
 	        .loghd { display: flex; align-items: center; justify-content: space-between;
-	                 margin-bottom: 6px; flex: 0 0 auto; }
-	        .loghd .st { font-weight: 650; color: #334155; font-size: 11px;
-	                     display: flex; align-items: center; gap: 6px; }
-	        .loghd .st::before { content: ""; width: 3px; height: 11px; border-radius: 2px;
-	                             background: #4f46e5; }
-	        .loghd .cnt { color: #94a3b8; font-size: 10px; }
-
-	        .log { flex: 1 1 auto; min-height: 0; overflow-y: auto; background: #f8fafc;
-	               border: 1px solid #eef2f7; border-radius: 9px; padding: 8px;
-	               display: flex; flex-direction: column; gap: 7px; }
-	        .log::-webkit-scrollbar { width: 6px; }
-	        .log::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+	                 height: 28px; margin-bottom: 8px; padding-right: 40px; flex: 0 0 auto; }
+	        .loghd .st { flex: 0 0 auto; font-size: 11.5px; font-weight: 600; color: var(--text);
+	                     display: flex; align-items: center; }
+	        .loghd .st::before { content: ""; width: 3px; height: 12px; border-radius: 2px;
+	                             background: var(--accent); margin-right: 7px; }
+	        .loghd .lessonprog { flex: 1 1 auto; min-width: 0; margin-left: 10px;
+	                             text-align: right; font-size: 10px; color: var(--text-3);
+	                             overflow: hidden; text-overflow: ellipsis;
+	                             white-space: nowrap; font-variant-numeric: tabular-nums; }
+	        .log { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding-right: 2px;
+	               display: flex; flex-direction: column; gap: 7px; cursor: auto;
+	               scrollbar-width: thin; scrollbar-color: var(--stroke-strong) transparent; }
+	        .log:empty::before { content: "暂无运行日志"; margin: auto; color: var(--text-3);
+	                             font-size: 11px; }
+	        .log::-webkit-scrollbar { width: 5px; }
+	        .log::-webkit-scrollbar-thumb { background: var(--stroke-strong); border-radius: 3px; }
 	        .log::-webkit-scrollbar-track { background: transparent; }
 
 	        /* 卡片 */
-	        .card { background: #fff; border: 1px solid #e8edf5; border-radius: 8px;
-	                overflow: hidden; flex: 0 0 auto; }
-	        .card.sys { background: #fbfcfe; border-color: #eef2f7; }
-	        .card .chd { display: flex; align-items: center; gap: 6px; padding: 5px 8px;
-	                     border-bottom: 1px solid #f1f5f9; }
-	        .card.sys .chd { border-bottom-color: #eef2f7; }
-	        .card .chd .bar { width: 3px; height: 11px; border-radius: 2px; flex: 0 0 auto; }
-	        .card.sys .chd .bar { background: #94a3b8; }
-	        .card.video .chd .bar { background: #10b981; }
-	        .card.job .chd .bar { background: #6366f1; }
-	        .card.q .chd .bar { background: #8b5cf6; }
-	        .card .chd .ctitle { font-weight: 650; color: #334155; font-size: 10.5px;
-	                             flex: 1 1 auto; min-width: 0; overflow: hidden;
+	        .card { background: var(--card); border: 1px solid var(--stroke);
+	                border-radius: 6px; overflow: hidden; flex: 0 0 auto;
+	                box-shadow: 0 1px 2px rgba(0,0,0,.035); }
+	        .card .chd { display: flex; align-items: center; gap: 7px; padding: 6px 9px;
+	                     border-bottom: 1px solid var(--stroke);
+	                     background: linear-gradient(180deg, rgba(255,255,255,.22), transparent); }
+	        .card .chd .bar { width: 3px; height: 11px; border-radius: 2px; flex: 0 0 auto;
+	                          background: var(--text-3); }
+	        .card.video .chd .bar { background: var(--accent); }
+	        .card.job .chd .bar { background: var(--accent-2); }
+	        .card.q .chd .bar { background: #0f7b0f; }
+	        .card .chd .ctitle { flex: 1 1 auto; min-width: 0; font-size: 10.5px;
+	                             font-weight: 600; color: var(--text); overflow: hidden;
 	                             text-overflow: ellipsis; white-space: nowrap; }
-	        .card .chd .cbadge { font-size: 9.5px; font-weight: 650; padding: 1px 6px;
-	                             border-radius: 999px; background: #f1f5f9; color: #64748b;
-	                             flex: 0 0 auto; }
-	        .card .chd .cbadge.ok { background: #ecfdf5; color: #047857; }
-	        .card .chd .cbadge.err { background: #fef2f2; color: #dc2626; }
-	        .card .chd .cbadge.run { background: #eef2ff; color: #4338ca; }
-	        .card .cbody { padding: 6px 8px 7px; }
+	        .card .chd .cbadge { flex: 0 0 auto; height: 17px; padding: 0 7px; border-radius: 999px;
+	                             display: inline-flex; align-items: center; font-size: 9.5px;
+	                             font-weight: 600; background: var(--track); color: var(--text-2); }
+	        .card .chd .cbadge.ok { background: var(--ok-soft); color: var(--success); }
+	        .card .chd .cbadge.err { background: var(--err-soft); color: var(--error); }
+	        .card .chd .cbadge.run { background: var(--accent-soft); color: var(--accent); }
+	        .card .cbody { padding: 6px 9px 8px; }
 	        .card .cbody:empty { display: none; }
 
-	        .cline { display: flex; gap: 6px; line-height: 1.5; font-size: 10.5px;
-	                 font-family: "Cascadia Mono", Consolas, monospace;
-	                 word-break: break-all; }
-	        .cline .ts { color: #b6c2d2; flex: 0 0 auto; font-size: 9.5px; padding-top: 1px; }
-	        .cline .tx { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; color: #64748b; }
+	        .cline { display: flex; gap: 7px; line-height: 1.55; font-size: 10.5px;
+	                 font-family: var(--mono); word-break: break-all; }
+	        .cline .ts { flex: 0 0 auto; padding-top: 1px; font-size: 9.5px;
+	                     color: var(--text-3); opacity: .72; }
+	        .cline .tx { flex: 1 1 auto; min-width: 0; white-space: pre-wrap;
+	                     color: var(--text-2); }
 	        .cline.INFO .tx { color: #15803d; }
 	        .cline.SKIP .tx { color: #2563eb; }
 	        .cline.WARN .tx { color: #b45309; }
@@ -1066,103 +1171,173 @@
 	        .cline.LLM .tx { color: #7c3aed; }
 	        .cline.PICK .tx { color: #0e7490; }
 
-	        /* 题目缩略图（点击弹出查看） */
-	        .thumb { display: flex; gap: 7px; align-items: center; margin-bottom: 5px;
-	                 padding: 5px; background: #f8fafc; border: 1px dashed #dbe3ee;
-	                 border-radius: 6px; cursor: pointer; transition: all .15s; }
-	        .thumb:hover { background: #eef2ff; border-color: #c7d2fe; }
-	        .thumb img { width: 74px; height: 40px; object-fit: cover; object-position: top left;
-	                     border-radius: 4px; border: 1px solid #e2e8f0; background: #fff;
-	                     flex: 0 0 auto; }
-	        .thumb .tt { flex: 1 1 auto; min-width: 0; color: #4f46e5; font-size: 10.5px;
+	        /* 题目缩略图 */
+	        .thumb { display: flex; gap: 8px; align-items: center; margin-bottom: 6px;
+	                 padding: 6px; background: var(--accent-soft);
+	                 border: 1px solid transparent; border-radius: 6px; cursor: pointer;
+	                 transition: background .12s, border-color .12s; }
+	        .thumb:hover { border-color: rgba(0, 103, 192, .35); }
+	        .thumb img { width: 76px; height: 42px; object-fit: cover; object-position: top left;
+	                     border-radius: 4px; border: 1px solid var(--stroke); flex: 0 0 auto;
+	                     background: #fff; }
+	        .thumb .tt { flex: 1 1 auto; min-width: 0; color: var(--accent); font-size: 10.5px;
 	                     font-weight: 600; line-height: 1.4; }
-	        .thumb .tt small { display: block; color: #94a3b8; font-weight: 400;
+	        .thumb .tt small { display: block; color: var(--text-3); font-weight: 400;
 	                           font-size: 9.5px; margin-top: 1px; }
 
 	        /* 图片查看弹窗 */
-	        .imgmask { position: absolute; inset: 0; background: rgba(15,23,42,.72);
+	        .imgmask { position: absolute; inset: 0; z-index: 100; padding: 18px;
 	                   display: flex; align-items: center; justify-content: center;
-	                   z-index: 100; padding: 18px; }
-	        .imgmask .box { background: #fff; border-radius: 10px; overflow: hidden;
-	                        max-width: 100%; max-height: 100%; display: flex;
-	                        flex-direction: column; box-shadow: 0 18px 48px rgba(0,0,0,.4); }
-	        .imgmask .bh { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
-	                       border-bottom: 1px solid #eef2f7; }
-	        .imgmask .bh .bt { font-weight: 650; color: #334155; font-size: 11px;
-	                           flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis;
+	                   background: rgba(20, 20, 20, .55); cursor: default;
+	                   backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+	        .imgmask .box { display: flex; flex-direction: column; max-width: 100%; max-height: 100%;
+	                        background: var(--card-solid, #fff); border-radius: 8px; overflow: hidden;
+	                        border: 1px solid var(--stroke);
+	                        box-shadow: 0 24px 60px rgba(0,0,0,.4); }
+	        .imgmask .bh { display: flex; align-items: center; gap: 8px; height: 38px;
+	                       padding: 0 8px 0 12px; border-bottom: 1px solid var(--stroke); }
+	        .imgmask .bh .bt { flex: 1 1 auto; font-size: 11px; font-weight: 600;
+	                           color: var(--text); overflow: hidden; text-overflow: ellipsis;
 	                           white-space: nowrap; }
-	        .imgmask .bh .bx { cursor: pointer; color: #94a3b8; font-size: 16px; line-height: 1;
-	                           padding: 0 3px; border-radius: 5px; }
-	        .imgmask .bh .bx:hover { background: #fef2f2; color: #dc2626; }
+	        .imgmask .bh .bx { width: 30px; height: 26px; border-radius: 4px; cursor: pointer;
+	                           display: flex; align-items: center; justify-content: center;
+	                           color: var(--text-2); font-size: 16px; }
+	        .imgmask .bh .bx:hover { background: var(--err-soft); color: var(--error); }
 	        .imgmask .bb { overflow: auto; padding: 8px; background: #fff; }
 	        .imgmask .bb img { display: block; width: 100%; background: #fff; }
+
+	        @media (max-width: 640px) {
+	          .body { flex-direction: column; height: auto; max-height: 76vh; overflow-y: auto; }
+	          .col-left { width: auto; border-right: 0; border-bottom: 1px solid var(--stroke);
+	                      overflow: visible; }
+	          .col-right { flex: 0 0 auto; height: 244px; }
+	        }
+
+	        @media (prefers-color-scheme: dark) {
+	          .panel {
+	            --bg: rgba(32, 32, 32, .90);
+	            --card: rgba(255, 255, 255, .055);
+	            --card-solid: #2b2b2b;
+	            --stroke: rgba(255, 255, 255, .085);
+	            --stroke-strong: rgba(255, 255, 255, .20);
+	            --text: #f3f3f3;
+	            --text-2: #c7c7c7;
+	            --text-3: #9a9a9a;
+	            --accent: #60cdff;
+	            --accent-hover: #7fd8ff;
+	            --accent-pressed: #4cc2ff;
+	            --accent-text: #003a4d;
+	            --accent-soft: rgba(96, 205, 255, .14);
+	            --accent-2: #b69df8;
+	            --accent-2-soft: rgba(182, 157, 248, .16);
+	            --success: #6ccb5f;
+	            --warn: #f0b45a;
+	            --error: #ff99a4;
+	            --ok-soft: rgba(108, 203, 95, .16);
+	            --warn-soft: rgba(240, 180, 90, .16);
+	            --err-soft: rgba(255, 153, 164, .16);
+	            --hover: rgba(255, 255, 255, .06);
+	            --track: rgba(255, 255, 255, .12);
+	            --inset: rgba(255, 255, 255, .05);
+	            --shadow: 0 24px 64px rgba(0, 0, 0, .55), 0 2px 8px rgba(0, 0, 0, .3);
+	          }
+	          .card .chd { background: linear-gradient(180deg, rgba(255,255,255,.04), transparent); }
+	          .mainbtn { box-shadow: none; }
+	          .cline.INFO .tx { color: #6ccb5f; }
+	          .cline.SKIP .tx { color: #7cb8ff; }
+	          .cline.WARN .tx { color: #f0b45a; }
+	          .cline.ERROR .tx { color: #ff99a4; }
+	          .cline.OK .tx { color: #5fd4c4; }
+	          .cline.LLM .tx { color: #c3a6ff; }
+	          .cline.PICK .tx { color: #6fd3e0; }
+	        }
 	      </style>
-	      <div class="panel">
-	        <div class="titlebar" id="titlebar">
-	          <span class="brand"></span>
-	          <span class="t">学习通任务点助手</span>
-	          <span class="ibtn" id="btnmin" title="折叠">—</span>
-	        </div>
-	        <div class="body" id="body">
-	          <div class="col-left">
-	            <div class="statline">
-	              <span class="pill p-idle" id="vstatus"><i></i>未启动</span>
-	              <span class="curtask" id="vcur">—</span>
-	            </div>
-	            <div class="prog">
-	              <div class="prow">
-	                <span class="lbl">视频任务点</span>
-	                <span class="bar v"><span id="barv"></span></span>
-	                <span class="cnt" id="vtask">0 / 0</span>
+	      <div class="panel" id="panel">
+	        <button class="fab" id="fab" title="展开学习通任务助手" aria-label="展开面板">
+	          <svg viewBox="0 0 16 16" aria-hidden="true">
+	            <path d="M4.2 2.6 13 8l-8.8 5.4V2.6Z" fill="currentColor"/>
+	          </svg>
+	        </button>
+	        <div class="shell" id="shell">
+	          <button class="collapse" id="btnmin" title="收起面板" aria-label="收起面板">
+	            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+	              <path d="M4 10.2 8 6.2l4 4" stroke="currentColor" stroke-width="1.5"
+	                    stroke-linecap="round" stroke-linejoin="round"/>
+	            </svg>
+	          </button>
+	          <div class="body" id="body">
+	            <div class="col-left">
+	              <div class="dock" id="dock">
+	                <div class="dock-top">
+	                  <span class="pill p-idle" id="vstatus"><i></i>未启动</span>
+	                  <span class="curtask" id="vcur">—</span>
+	                </div>
+	                <div class="dock-actions">
+	                  <button class="iconbtn" id="btnadv" title="高级设置" aria-label="高级设置">
+	                    <svg viewBox="0 0 24 24" aria-hidden="true">
+	                      <path fill="currentColor" d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+	                    </svg>
+	                    <span class="dot warn" id="advdot"></span>
+	                  </button>
+	                  <button class="mainbtn start" id="btnstart">开始刷课</button>
+	                </div>
 	              </div>
-	              <div class="prow">
-	                <span class="lbl">答题任务点</span>
-	                <span class="bar a"><span id="bara"></span></span>
-	                <span class="cnt" id="vanswer">0 / 0</span>
+
+	              <div class="sect"><span class="st">运行设置</span></div>
+	              <div class="switches">
+	                <label class="sw" title="视频静音播放（观看时长照常上报）">
+	                  <span class="swlead">
+	                    <svg viewBox="0 0 16 16" fill="none"><path d="M8.6 2.5 5.4 5.2H3.2a.7.7 0 0 0-.7.7v4.2c0 .4.3.7.7.7h2.2l3.2 2.7V2.5Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M11 6a2.6 2.6 0 0 1 0 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+	                  </span>
+	                  <span class="swlabel">静音播放</span>
+	                  <input type="checkbox" id="optmute"><span class="track"></span>
+	                </label>
+	                <label class="sw" title="自动探测课程允许的最高倍速；若站点不允许则回退 1x">
+	                  <span class="swlead">
+	                    <svg viewBox="0 0 16 16" fill="none"><path d="M3.2 4.6 7 8l-3.8 3.4V4.6Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M8.5 4.6 12.3 8l-3.8 3.4V4.6Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+	                  </span>
+	                  <span class="swlabel">最高倍速</span>
+	                  <input type="checkbox" id="optautorate"><span class="track"></span>
+	                </label>
+	                <label class="sw" title="调用多模态模型自动作答答题任务点">
+	                  <span class="swlead">
+	                    <svg viewBox="0 0 16 16" fill="none"><path d="M8 2.2l1 2.9 2.9 1-2.9 1-1 2.9-1-2.9-2.9-1 2.9-1 1-2.9Z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/><path d="M12.4 9.5l.5 1.4 1.4.5-1.4.5-.5 1.4-.5-1.4-1.4-.5 1.4-.5.5-1.4Z" fill="currentColor"/></svg>
+	                  </span>
+	                  <span class="swlabel">自动答题</span>
+	                  <input type="checkbox" id="optanswer"><span class="track"></span>
+	                </label>
+	                <label class="sw" title="作答完成后自动点击「暂时保存」">
+	                  <span class="swlead">
+	                    <svg viewBox="0 0 16 16" fill="none"><path d="M3.5 2.8h7.2l1.8 1.8v8.6H3.5V2.8Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M5.6 2.8v3.1h4.3V2.8M5.6 13.2V9.6h4.8v3.6" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+	                  </span>
+	                  <span class="swlabel">自动暂存</span>
+	                  <input type="checkbox" id="opttempsave"><span class="track"></span>
+	                </label>
+	                <label class="sw" title="已有答案的题目不再作答">
+	                  <span class="swlead">
+	                    <svg viewBox="0 0 16 16" fill="none"><path d="M8 13.2A5.2 5.2 0 1 0 8 2.8a5.2 5.2 0 0 0 0 10.4Z" stroke="currentColor" stroke-width="1.2"/><path d="m5.8 8.1 1.6 1.6 2.9-3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+	                  </span>
+	                  <span class="swlabel">跳过已作答</span>
+	                  <input type="checkbox" id="optskipfilled"><span class="track"></span>
+	                </label>
 	              </div>
-	              <div class="lesson" id="vlesson">—</div>
 	            </div>
-	            <button class="mainbtn start" id="btnstart">开始刷课</button>
-
-	            <div class="sect"><span class="st">运行设置</span></div>
-	            <div class="switches">
-	              <label class="sw">静音播放<input type="checkbox" id="optmute"><span class="track"></span></label>
-	              <label class="sw">自动答题<input type="checkbox" id="optanswer"><span class="track"></span></label>
-	              <label class="sw">自动暂存<input type="checkbox" id="opttempsave"><span class="track"></span></label>
-	              <label class="sw">跳过已作答<input type="checkbox" id="optskipfilled"><span class="track"></span></label>
-	            </div>
-
-	            <div class="sect">
-	              <span class="st">作答题型</span>
-	            </div>
-	            <div class="chips" id="typechips">
-	              <span class="chip on" data-type="单选">单选题</span>
-	              <span class="chip on" data-type="多选">多选题</span>
-	              <span class="chip on" data-type="判断">判断题</span>
-	            </div>
-
-	            <div class="sect">
-	              <span class="st">模型</span>
-	              <span class="tag" id="tagllm">未配置</span>
-	              <span class="llmname" id="llmmodel">—</span>
-	              <span class="lnk" id="btnllm2">配置…</span>
+	            <div class="col-right">
+	              <div class="loghd">
+	                <span class="st">运行日志</span>
+	                <span class="lessonprog" id="vlesson" title="当前课时">—</span>
+	              </div>
+	              <div class="log" id="vlog"></div>
 	            </div>
 	          </div>
-	          <div class="col-right">
-	            <div class="loghd">
-	              <span class="st">运行日志</span>
-	              <span class="cnt" id="logcnt"></span>
+	          <div class="imgmask" id="imgmask" style="display:none">
+	            <div class="box">
+	              <div class="bh">
+	                <span class="bt" id="imgtitle">题目图片</span>
+	                <span class="bx" id="imgclose" title="关闭">×</span>
+	              </div>
+	              <div class="bb"><img id="imgfull" alt="题目图片"></div>
 	            </div>
-	            <div class="log" id="vlog"></div>
-	          </div>
-	        </div>
-	        <div class="imgmask" id="imgmask" style="display:none">
-	          <div class="box">
-	            <div class="bh">
-	              <span class="bt" id="imgtitle">题目图片</span>
-	              <span class="bx" id="imgclose" title="关闭">×</span>
-	            </div>
-	            <div class="bb"><img id="imgfull" alt="题目图片"></div>
 	          </div>
 	        </div>
 	      </div>`;
@@ -1181,38 +1356,42 @@
 			S.panels.push(host);
 
 			el = {
+				panel: root.getElementById("panel"),
+				shell: root.getElementById("shell"),
+				fab: root.getElementById("fab"),
+				dock: root.getElementById("dock"),
 				status: root.getElementById("vstatus"),
 				lesson: root.getElementById("vlesson"),
-				task: root.getElementById("vtask"),
-				answer: root.getElementById("vanswer"),
-				barV: root.getElementById("barv"),
-				barA: root.getElementById("bara"),
 				cur: root.getElementById("vcur"),
 				log: root.getElementById("vlog"),
-				logCnt: root.getElementById("logcnt"),
 				imgmask: root.getElementById("imgmask"),
 				imgFull: root.getElementById("imgfull"),
 				imgTitle: root.getElementById("imgtitle"),
 				btnStart: root.getElementById("btnstart"),
+				btnAdv: root.getElementById("btnadv"),
+				advDot: root.getElementById("advdot"),
 				optMute: root.getElementById("optmute"),
+				optAutoRate: root.getElementById("optautorate"),
 				optAnswer: root.getElementById("optanswer"),
 				optTempSave: root.getElementById("opttempsave"),
 				optSkipFilled: root.getElementById("optskipfilled"),
-				chips: root.getElementById("typechips"),
-				tagLlm: root.getElementById("tagllm"),
-				llmModel: root.getElementById("llmmodel"),
-				titlebar: root.getElementById("titlebar"),
-				body: root.getElementById("body"),
 				btnMin: root.getElementById("btnmin"),
 			};
 
 			const ans = store.config("answer", ANSWER_DEFAULTS);
+			const vid = store.config("video", VIDEO_DEFAULTS);
 			el.optMute.checked = !!store.get("mute", false);
+			el.optAutoRate.checked = vid.autoRate !== false;
 			el.optAnswer.checked = !!ans.enabled;
 			el.optTempSave.checked = !!ans.autoTempSave;
 			el.optSkipFilled.checked = !!ans.skipFilled;
 
 			el.optMute.addEventListener("change", () => store.set("mute", el.optMute.checked));
+			el.optAutoRate.addEventListener("change", () => {
+				patchVideo({ autoRate: el.optAutoRate.checked });
+				Log.useSystem();
+				Log.info(el.optAutoRate.checked ? "已开启自动最高倍速" : "已关闭自动倍速，按 1x 播放");
+			});
 			el.optAnswer.addEventListener("change", () => {
 				patchAnswer({ enabled: el.optAnswer.checked });
 				refreshBadges();
@@ -1224,28 +1403,11 @@
 				patchAnswer({ skipFilled: el.optSkipFilled.checked }),
 			);
 
-			// 题型 chip
-			el.chips.addEventListener("click", (e) => {
-				const chip = e.target.closest(".chip");
-				if (!chip) return;
-				const type = chip.getAttribute("data-type");
-				const cur = store.config("answer", ANSWER_DEFAULTS).types || {};
-				const next = Object.assign({}, cur);
-				next[type] = !(next[type] !== false);
-				// 至少保留一种题型，避免全部取消后无心可用
-				if (SUPPORTED_TYPES.every((t) => next[t] === false)) {
-					Log.warn("至少需要保留一种作答题型");
-					return;
-				}
-				patchAnswer({ types: next });
-				syncChips();
-			});
-
 			el.btnStart.addEventListener("click", () => {
 				if (S.running) Runner.stop();
 				else Runner.start();
 			});
-			root.getElementById("btnllm2").addEventListener("click", () => ConfigUI.open());
+			el.btnAdv.addEventListener("click", () => ConfigUI.open());
 			// 图片弹窗关闭
 			root.getElementById("imgclose").addEventListener("click", closeImage);
 			el.imgmask.addEventListener("click", (e) => {
@@ -1254,16 +1416,182 @@
 			root.addEventListener("keydown", (e) => {
 				if (e.key === "Escape") closeImage();
 			});
-			el.btnMin.addEventListener("click", () => {
-				const hidden = el.body.style.display === "none";
-				el.body.style.display = hidden ? "" : "none";
-				el.btnMin.textContent = hidden ? "—" : "+";
-			});
+			el.btnMin.addEventListener("click", () => setCollapsed(true));
+			el.log.addEventListener(
+				"scroll",
+				() => {
+					followLog = isNearBottom();
+				},
+				{ passive: true },
+			);
 
 			restorePosition();
 			bindDrag();
-			syncChips();
+			bindFab();
 			refreshBadges();
+		}
+
+		/** 收起 / 展开：收起后面板变为圆形播放按钮 */
+		let collapseAnim = 0;
+
+		/** 收起 / 展开：收起时面板向收起按钮方向收缩为圆形播放按钮 */
+		function setCollapsed(collapsed) {
+			if (!el.panel) return;
+			if (el.panel.classList.contains("collapsed") === collapsed) return;
+			const token = ++collapseAnim;
+			const reduce =
+				typeof window.matchMedia === "function" &&
+				window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+			const dur = 180;
+
+			if (collapsed) {
+				el.panel.classList.remove("expanding");
+				const pr = el.panel.getBoundingClientRect();
+				const br = el.btnMin.getBoundingClientRect();
+				const size = 54;
+				const targetLeft = clamp(
+					br.left + br.width / 2 - size / 2,
+					0,
+					Math.max(0, window.innerWidth - size),
+				);
+				const targetTop = clamp(
+					br.top + br.height / 2 - size / 2,
+					0,
+					Math.max(0, window.innerHeight - size),
+				);
+				host.style.right = "auto";
+				host.style.left = pr.left + "px";
+				host.style.top = pr.top + "px";
+				if (reduce) {
+					el.panel.classList.add("collapsed");
+					el.fab.setAttribute("aria-expanded", "false");
+					host.style.left = targetLeft + "px";
+					host.style.top = targetTop + "px";
+					return;
+				}
+				el.panel.classList.add("collapsing");
+				el.panel.style.width = pr.width + "px";
+				el.panel.style.height = pr.height + "px";
+				el.panel.style.borderRadius = "8px";
+				const start = { left: pr.left, top: pr.top, w: pr.width, h: pr.height };
+				const t0 = performance.now();
+				const step = (now) => {
+					if (token !== collapseAnim) return;
+					const p = Math.min(1, (now - t0) / dur);
+					const e = 1 - Math.pow(1 - p, 3);
+					host.style.left = start.left + (targetLeft - start.left) * e + "px";
+					host.style.top = start.top + (targetTop - start.top) * e + "px";
+					el.panel.style.width = start.w + (size - start.w) * e + "px";
+					el.panel.style.height = start.h + (size - start.h) * e + "px";
+					el.panel.style.borderRadius = 8 + (27 - 8) * e + "px";
+					if (p < 1) {
+						requestAnimationFrame(step);
+						return;
+					}
+					el.panel.classList.remove("collapsing");
+					el.panel.classList.add("collapsed");
+					el.fab.setAttribute("aria-expanded", "false");
+					el.panel.style.width = "";
+					el.panel.style.height = "";
+					el.panel.style.borderRadius = "";
+					host.style.left = targetLeft + "px";
+					host.style.top = targetTop + "px";
+				};
+				requestAnimationFrame(step);
+				return;
+			}
+
+			// 展开：从圆形按钮位置恢复，右边缘与按钮右边缘对齐（向左下方展开）
+			el.panel.classList.remove("collapsing");
+			const fr = el.panel.getBoundingClientRect();
+			el.panel.classList.add("expanding");
+			el.panel.classList.remove("collapsed");
+			el.fab.setAttribute("aria-expanded", "true");
+			const full = el.panel.getBoundingClientRect();
+			const targetLeft = clamp(
+				fr.right - full.width,
+				0,
+				Math.max(0, window.innerWidth - full.width),
+			);
+			const targetTop = clamp(
+				fr.top,
+				0,
+				Math.max(0, window.innerHeight - full.height),
+			);
+			host.style.right = "auto";
+			if (reduce) {
+				host.style.left = targetLeft + "px";
+				host.style.top = targetTop + "px";
+				el.panel.classList.remove("expanding");
+				return;
+			}
+			host.style.left = fr.left + "px";
+			host.style.top = fr.top + "px";
+			el.panel.style.width = fr.width + "px";
+			el.panel.style.height = fr.height + "px";
+			el.panel.style.borderRadius = "27px";
+			const start = { left: fr.left, top: fr.top, w: fr.width, h: fr.height };
+			const t0 = performance.now();
+			const step = (now) => {
+				if (token !== collapseAnim) return;
+				const p = Math.min(1, (now - t0) / dur);
+				const e = 1 - Math.pow(1 - p, 3);
+				host.style.left = start.left + (targetLeft - start.left) * e + "px";
+				host.style.top = start.top + (targetTop - start.top) * e + "px";
+				el.panel.style.width = start.w + (full.width - start.w) * e + "px";
+				el.panel.style.height = start.h + (full.height - start.h) * e + "px";
+				el.panel.style.borderRadius = 27 + (8 - 27) * e + "px";
+				if (p < 1) {
+					requestAnimationFrame(step);
+					return;
+				}
+				el.panel.classList.remove("expanding");
+				el.panel.style.width = "";
+				el.panel.style.height = "";
+				el.panel.style.borderRadius = "";
+				host.style.left = targetLeft + "px";
+				host.style.top = targetTop + "px";
+			};
+			requestAnimationFrame(step);
+		}
+
+		/** 圆形收起态支持拖动与点击展开 */
+		function bindFab() {
+			let down = null;
+			el.fab.addEventListener("pointerdown", (e) => {
+				if (!el.panel.classList.contains("collapsed")) return;
+				const r = host.getBoundingClientRect();
+				down = { sx: e.clientX, sy: e.clientY, ox: r.left, oy: r.top, moved: false };
+				host.style.right = "auto";
+				try {
+					el.fab.setPointerCapture(e.pointerId);
+				} catch (err) {
+					/* noop */
+				}
+			});
+			el.fab.addEventListener("pointermove", (e) => {
+				if (!down) return;
+				const dx = e.clientX - down.sx,
+					dy = e.clientY - down.sy;
+				if (!down.moved && Math.abs(dx) + Math.abs(dy) < 5) return;
+				down.moved = true;
+				const b = bounds();
+				host.style.left = clamp(down.ox + dx, 0, b.maxX) + "px";
+				host.style.top = clamp(down.oy + dy, 0, b.maxY) + "px";
+			});
+			const end = () => {
+				if (!down) return;
+				const moved = down.moved;
+				down = null;
+				if (moved) {
+					const r = host.getBoundingClientRect();
+					store.set("panelPos", { x: Math.round(r.left), y: Math.round(r.top) });
+				} else {
+					setCollapsed(false);
+				}
+			};
+			el.fab.addEventListener("pointerup", end);
+			el.fab.addEventListener("pointercancel", end);
 		}
 
 		/** 局部更新答题配置（避免覆盖其它字段） */
@@ -1275,24 +1603,22 @@
 			store.set("answer", cur);
 		}
 
-		/** 同步题型 chip 的选中态 */
-		function syncChips() {
-			if (!el.chips) return;
-			const types = store.config("answer", ANSWER_DEFAULTS).types || {};
-			Dom.toArray(el.chips.querySelectorAll(".chip")).forEach((chip) => {
-				const t = chip.getAttribute("data-type");
-				const on = types[t] !== false;
-				chip.classList.toggle("on", on);
+		/** 局部更新视频配置 */
+		function patchVideo(patch) {
+			const cur = store.config("video", VIDEO_DEFAULTS);
+			Object.keys(patch).forEach((k) => {
+				cur[k] = patch[k];
 			});
+			store.set("video", cur);
 		}
 
 		function refreshBadges() {
-			if (!el.tagLlm) return;
+			if (!el.advDot) return;
 			const cfg = store.config("llm", LLM_DEFAULTS);
-			const ok = !!cfg.apiKey && !!cfg.baseUrl && !!cfg.model;
-			el.tagLlm.textContent = ok ? "已配置" : "未配置";
-			el.tagLlm.className = "tag" + (ok ? "" : " warn");
-			if (el.llmModel) el.llmModel.textContent = ok ? cfg.model : "点击右侧「配置…」填写接口信息";
+			const ok = !!(cfg.apiKey && cfg.baseUrl && cfg.model);
+			el.advDot.className = "dot " + (ok ? "ok" : "warn");
+			if (el.btnAdv)
+				el.btnAdv.title = ok ? "高级设置 · 模型：" + cfg.model : "高级设置 · 模型未配置";
 		}
 
 		/** 面板可视边界（按实际尺寸裁剪，避免宽带面板被拖出屏幕外） */
@@ -1318,46 +1644,75 @@
 		}
 
 		function bindDrag() {
-			let sx = 0,
-				sy = 0,
-				ox = 0,
-				oy = 0,
-				dragging = false;
-			el.titlebar.addEventListener("pointerdown", (e) => {
-				if (e.target.classList.contains("ibtn")) return;
-				dragging = true;
+			let drag = null;
+			el.shell.addEventListener("pointerdown", (e) => {
+				if (e.button !== 0) return;
+				if (el.panel.classList.contains("collapsed")) return;
+				if (el.imgmask && el.imgmask.style.display !== "none") return;
+				const t = e.target;
+				// 按钮 / 开关 / 缩略图 / 日志卡片 / 弹窗等区域不参与拖拽
+				if (
+					t.closest(
+						"button, input, select, textarea, a, label, .thumb, .imgmask, .fab, .card",
+					)
+				)
+					return;
+				// 日志空白背景可拖拽，但滚动条区域留给原生滚动
+				if (el.log && t.closest(".log")) {
+					const lr = el.log.getBoundingClientRect();
+					const sbw = el.log.offsetWidth - el.log.clientWidth;
+					if (sbw > 0 && e.clientX >= lr.right - sbw) return;
+				}
 				const r = host.getBoundingClientRect();
-				sx = e.clientX;
-				sy = e.clientY;
-				ox = r.left;
-				oy = r.top;
+				drag = {
+					sx: e.clientX,
+					sy: e.clientY,
+					ox: r.left,
+					oy: r.top,
+					moved: false,
+					id: e.pointerId,
+				};
 				host.style.right = "auto";
 				try {
-					el.titlebar.setPointerCapture(e.pointerId);
+					el.shell.setPointerCapture(e.pointerId);
 				} catch (err) {
 					/* noop */
 				}
+				e.preventDefault();
 			});
-			el.titlebar.addEventListener("pointermove", (e) => {
-				if (!dragging) return;
+			el.shell.addEventListener("pointermove", (e) => {
+				if (!drag || e.pointerId !== drag.id) return;
+				const dx = e.clientX - drag.sx,
+					dy = e.clientY - drag.sy;
+				if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+				if (!drag.moved) {
+					drag.moved = true;
+					el.panel.classList.add("dragging");
+				}
+				e.preventDefault();
 				const b = bounds();
-				host.style.left = clamp(ox + e.clientX - sx, 0, b.maxX) + "px";
-				host.style.top = clamp(oy + e.clientY - sy, 0, b.maxY) + "px";
+				host.style.left = clamp(drag.ox + dx, 0, b.maxX) + "px";
+				host.style.top = clamp(drag.oy + dy, 0, b.maxY) + "px";
 			});
 			const end = () => {
-				if (!dragging) return;
-				dragging = false;
-				const r = host.getBoundingClientRect();
-				store.set("panelPos", { x: Math.round(r.left), y: Math.round(r.top) });
+				if (!drag) return;
+				const moved = drag.moved;
+				drag = null;
+				el.panel.classList.remove("dragging");
+				if (moved) {
+					const r = host.getBoundingClientRect();
+					store.set("panelPos", { x: Math.round(r.left), y: Math.round(r.top) });
+				}
 			};
-			el.titlebar.addEventListener("pointerup", end);
-			el.titlebar.addEventListener("pointercancel", end);
+			el.shell.addEventListener("pointerup", end);
+			el.shell.addEventListener("pointercancel", end);
 		}
 
 		// ============ 日志卡片流 ============
 		// 每张卡片是一段独立的过程记录：系统信息 / 视频任务点 / 答题任务点 / 单道题目
 
 		const cards = new Map(); // key → { node, body, badge, lines, kind }
+		let followLog = true; // 用户停留在底部时自动跟随新日志
 
 		/** 建卡或取卡 */
 		function ensureCard(key, opts) {
@@ -1396,6 +1751,10 @@
 		function cardMeta(key, opts) {
 			const c = ensureCard(key, opts);
 			if (!c) return;
+			if (opts && opts.kind) {
+				c.node.className = "card " + opts.kind;
+				c.kind = opts.kind;
+			}
 			if (opts && opts.title) c.title.textContent = opts.title;
 			if (opts && opts.badge !== undefined) {
 				c.badge.textContent = opts.badge;
@@ -1420,7 +1779,6 @@
 			row.appendChild(tx);
 			c.body.appendChild(row);
 			c.lines++;
-			cards_total++;
 			autoscroll();
 		}
 
@@ -1460,7 +1818,6 @@
 			el.imgFull.removeAttribute("src");
 		}
 
-		let cards_total = 0;
 		function trimCards() {
 			while (cards.size > CFG.logMaxCards && el.log.firstChild) {
 				const first = el.log.firstChild;
@@ -1473,24 +1830,23 @@
 				}
 				el.log.removeChild(first);
 			}
-			updateLogCount();
 		}
 
-		function updateLogCount() {
-			if (el.logCnt) el.logCnt.textContent = cards.size > 0 ? cards.size + " 张卡片" : "";
+		function isNearBottom() {
+			if (!el.log) return true;
+			return el.log.scrollHeight - el.log.scrollTop - el.log.clientHeight < 80;
 		}
 
 		function autoscroll() {
-			if (el.log) el.log.scrollTop = el.log.scrollHeight;
-			updateLogCount();
+			// 用户向上翻阅历史日志时不强制拉回底部
+			if (el.log && (followLog || isNearBottom())) el.log.scrollTop = el.log.scrollHeight;
 		}
 
 		/** 清空全部卡片（重新开始时调用） */
 		function clearCards() {
 			cards.clear();
 			if (el.log) el.log.innerHTML = "";
-			cards_total = 0;
-			updateLogCount();
+			followLog = true;
 		}
 
 		const STATUS_CLS = {
@@ -1502,16 +1858,9 @@
 			未启动: "p-idle",
 		};
 
-		function setProgress(barEl, done, seen) {
-			if (!barEl) return;
-			const pct = seen > 0 ? Math.min(100, Math.round((done / seen) * 100)) : 0;
-			barEl.style.width = pct + "%";
-		}
-
 		return {
 			ensure,
 			refreshBadges,
-			syncChips,
 			// 日志卡片流 API
 			ensureCard,
 			cardMeta,
@@ -1529,19 +1878,14 @@
 					el.btnStart.className = "mainbtn " + (running ? "stop" : "start");
 				}
 				if (!el.status) return;
-				el.status.className = "pill " + (STATUS_CLS[s] || "p-idle");
+				const cls = STATUS_CLS[s] || "p-idle";
+				if (el.dock) el.dock.dataset.state = cls;
+				el.status.className = "pill " + cls;
 				el.status.innerHTML = "<i></i>" + s;
 			},
 			setLesson(text) {
 				if (el.lesson) el.lesson.textContent = text;
-			},
-			setTaskStat() {
-				if (el.task) el.task.textContent = S.videoDone + " / " + S.videoSeen;
-				setProgress(el.barV, S.videoDone, S.videoSeen);
-			},
-			setAnswerStat() {
-				if (el.answer) el.answer.textContent = S.answerDone + " / " + S.answerSeen;
-				setProgress(el.barA, S.answerDone, S.answerSeen);
+				if (el.lesson) el.lesson.title = text;
 			},
 			setTask(text) {
 				S.taskLabel = text;
@@ -1560,115 +1904,211 @@
 
 		const HTML = `
 	    <style>
-	      :host { all: initial; }
+	      :host { all: initial; color-scheme: light dark; }
 	      * { box-sizing: border-box; margin: 0; padding: 0;
-	          font-family: "Microsoft YaHei", "PingFang SC", -apple-system, sans-serif; }
-	      .mask { position: fixed; inset: 0; background: rgba(15,23,42,.45); display: flex;
-	              align-items: center; justify-content: center; z-index: 2147483600;
-	              backdrop-filter: blur(2px); }
-	      .dlg { width: 580px; max-height: 88vh; overflow: auto; background: #fff;
-	             border-radius: 16px; box-shadow: 0 24px 64px rgba(15,23,42,.28);
-	             font-size: 13px; color: #0f172a; }
-	      .hd { padding: 18px 22px 14px; display: flex; justify-content: space-between;
-	            align-items: center; border-bottom: 1px solid #eef2f7; position: sticky; top: 0;
-	            background: #fff; border-radius: 16px 16px 0 0; z-index: 2; }
-	      .hd .ttl { display: flex; align-items: center; gap: 9px; }
-	      .hd .dot { width: 9px; height: 9px; border-radius: 50%; background: #4f46e5; }
-	      .hd h3 { font-size: 15px; font-weight: 650; letter-spacing: .2px; }
-	      .hd .x { cursor: pointer; width: 26px; height: 26px; border-radius: 7px; display: flex;
-	               align-items: center; justify-content: center; color: #94a3b8; font-size: 17px;
-	               transition: all .15s; }
-	      .hd .x:hover { background: #fef2f2; color: #ef4444; }
-	      .bd { padding: 6px 22px 4px; }
-	      .sec { margin: 16px 0 10px; font-weight: 650; color: #334155; font-size: 12.5px;
-	             display: flex; align-items: center; gap: 7px; }
-	      .sec::before { content: ""; width: 3px; height: 13px; border-radius: 2px; background: #4f46e5; }
-	      .sec .opt { color: #94a3b8; font-weight: 400; font-size: 11px; }
-	      .grid { display: grid; grid-template-columns: 112px 1fr; gap: 10px 14px; align-items: center; }
-	      .grid label { color: #64748b; font-size: 12.5px; }
-	      .grid .hint { grid-column: 2; color: #94a3b8; font-size: 11px; margin-top: -5px;
-	                    line-height: 1.5; }
+	          font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+	                       "Microsoft YaHei", "PingFang SC", sans-serif; }
+	      .mask { position: fixed; inset: 0; display: flex; align-items: center;
+	              justify-content: center; z-index: 2147483600;
+	              background: rgba(20, 20, 20, .45);
+	              backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+	      .dlg { --accent: #0067c0; --accent-hover: #1975c5; --accent-text: #fff;
+	             --stroke: rgba(0,0,0,.09); --stroke-strong: rgba(0,0,0,.16);
+	             --text: #1b1b1b; --text-2: #5c5c5c; --text-3: #8b8b8b;
+	             --field: rgba(255,255,255,.72); --card: rgba(255,255,255,.55);
+	             --inset: rgba(255,255,255,.60); --hover: rgba(0,0,0,.035);
+	             width: min(620px, calc(100vw - 32px)); max-height: 88vh; overflow: auto;
+	             background: rgba(243,243,243,.94);
+	             backdrop-filter: blur(40px) saturate(1.5);
+	             -webkit-backdrop-filter: blur(40px) saturate(1.5);
+	             border: 1px solid var(--stroke); border-radius: 8px;
+	             box-shadow: 0 28px 72px rgba(0,0,0,.34), 0 2px 8px rgba(0,0,0,.16);
+	             font-size: 12.5px; color: var(--text); }
+	      .hd { position: sticky; top: 0; z-index: 2; display: flex; align-items: center;
+	            justify-content: space-between; height: 48px; padding: 0 10px 0 18px;
+	            border-bottom: 1px solid var(--stroke);
+	            background: rgba(243,243,243,.97);
+	            backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+	      .hd h3 { font-family: "Segoe UI Variable Display", "Segoe UI",
+	               "Microsoft YaHei UI", sans-serif; font-size: 14px; font-weight: 600;
+	               letter-spacing: .1px; }
+	      .hd .x { width: 36px; height: 30px; border-radius: 4px; cursor: pointer;
+	               display: flex; align-items: center; justify-content: center;
+	               color: var(--text-2); font-size: 17px; transition: background .12s, color .12s; }
+	      .hd .x:hover { background: rgba(196,43,28,.12); color: #c42b1c; }
+	      .bd { padding: 2px 18px 14px; }
+	      .sec { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px;
+	             font-size: 12px; font-weight: 600; color: var(--text); }
+	      .sec::before { content: ""; width: 3px; height: 12px; border-radius: 2px;
+	                     background: var(--accent); }
+	      .group { background: var(--card); border: 1px solid var(--stroke);
+	               border-radius: 8px; overflow: hidden;
+	               box-shadow: inset 0 1px 0 var(--inset); }
+	      .row { display: flex; align-items: center; gap: 14px;
+	             min-height: 50px; padding: 8px 14px; }
+	      .row + .row { border-top: 1px solid var(--stroke); }
+	      .row:hover { background: var(--hover); }
+	      .row .rl { flex: 0 0 128px; color: var(--text); font-size: 12.5px; }
+	      .row .ctl { flex: 1 1 auto; min-width: 0; }
+	      .row .ctl.narrow { flex: 0 1 300px; margin-left: auto; }
+	      .row .ctl.tiny { flex: 0 1 120px; margin-left: auto; }
+	      .row.col { flex-direction: column; align-items: stretch; gap: 6px; }
+	      .row.col .rl { flex: none; }
+	      .row .chips { flex: 0 1 auto; margin-left: auto; justify-content: flex-end; }
+	      .chkctl { margin-left: auto; width: 18px; height: 18px; flex: 0 0 auto;
+	                accent-color: var(--accent); cursor: pointer; }
 	      input[type=text], input[type=password], input[type=number], select, textarea {
-	        width: 100%; padding: 8px 11px; border: 1px solid #e2e8f0; border-radius: 9px;
-	        font-size: 12.5px; color: #0f172a; background: #f8fafc; outline: none;
-	        transition: all .15s; }
-	      input:hover, select:hover, textarea:hover { border-color: #cbd5e1; }
-	      input:focus, select:focus, textarea:focus { border-color: #818cf8; background: #fff;
-	        box-shadow: 0 0 0 3px rgba(99,102,241,.12); }
-	      textarea { min-height: 60px; resize: vertical; font-family: Consolas, monospace; }
-	      .chk { display: flex; align-items: center; gap: 8px; color: #475569; font-size: 12.5px;
-	             cursor: pointer; user-select: none; }
-	      .chk input { width: 15px; height: 15px; accent-color: #4f46e5; cursor: pointer; }
-	      .ft { display: flex; gap: 10px; padding: 16px 22px 20px; align-items: center;
-	            position: sticky; bottom: 0; background: #fff; border-top: 1px solid #eef2f7;
-	            border-radius: 0 0 16px 16px; }
+	        width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--stroke-strong);
+	        border-radius: 4px; background: var(--field); color: var(--text);
+	        font-family: inherit; font-size: 12px; outline: none;
+	        transition: border-color .12s, background .12s, box-shadow .12s; }
+	      textarea { height: auto; min-height: 64px; padding: 7px 10px; resize: vertical;
+	                 font-family: "Cascadia Mono", Consolas, monospace; }
+	      input:hover, select:hover, textarea:hover { border-color: rgba(0,0,0,.28); }
+	      input:focus, select:focus, textarea:focus { background: #fff;
+	        border-color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
+	      .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+	      .chip { display: inline-flex; align-items: center; height: 28px; padding: 0 12px;
+	              border: 1px solid var(--stroke-strong); border-radius: 999px;
+	              background: transparent; color: var(--text-2); font-size: 12px;
+	              font-weight: 500; cursor: pointer; user-select: none;
+	              transition: background .12s, color .12s, border-color .12s; }
+	      .chip:hover { background: rgba(0,0,0,.045); color: var(--text); }
+	      .chip.on { background: var(--accent); border-color: var(--accent);
+	                 color: var(--accent-text); }
+	      .chip.on:hover { background: var(--accent-hover); }
+	      .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+	      .ft { position: sticky; bottom: 0; display: flex; align-items: center; gap: 8px;
+	            padding: 12px 18px 14px; border-top: 1px solid var(--stroke);
+	            background: rgba(243,243,243,.96); }
 	      .ft .grow { flex: 1; }
-	      button { padding: 9px 18px; border: 0; border-radius: 9px; cursor: pointer;
-	               font-size: 12.5px; font-weight: 600; transition: all .15s; }
-	      .primary { background: #4f46e5; color: #fff; }
-	      .primary:hover { background: #4338ca; }
-	      .ghost { background: #f1f5f9; color: #475569; }
-	      .ghost:hover { background: #e2e8f0; }
-	      .test { background: #ecfdf5; color: #047857; }
-	      .test:hover { background: #d1fae5; }
+	      button { height: 32px; padding: 0 16px; border: 1px solid transparent;
+	               border-radius: 4px; cursor: pointer; font-family: inherit;
+	               font-size: 12px; font-weight: 600;
+	               transition: background .12s, border-color .12s, color .12s; }
+	      button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+	      .primary { background: var(--accent); color: var(--accent-text); }
+	      .primary:hover { background: var(--accent-hover); }
+	      .ghost { background: rgba(255,255,255,.55); color: var(--text);
+	               border-color: var(--stroke-strong); }
+	      .ghost:hover { background: rgba(255,255,255,.9); }
+	      .test { background: rgba(15,123,15,.10); color: #0f7b0f; }
+	      .test:hover { background: rgba(15,123,15,.16); }
 	      button:disabled { opacity: .5; cursor: not-allowed; }
-	      .status { font-size: 12px; color: #64748b; max-width: 250px; overflow: hidden;
-	                text-overflow: ellipsis; white-space: nowrap; }
-	      .status.ok { color: #047857; }
-	      .status.err { color: #dc2626; }
-	      .status.warn { color: #b45309; }
+	      .status { max-width: 250px; overflow: hidden; text-overflow: ellipsis;
+	                white-space: nowrap; font-size: 11px; color: var(--text-2); }
+	      .status.ok { color: #0f7b0f; }
+	      .status.err { color: #c42b1c; }
+	      .status.warn { color: #9d5d00; }
+	      .dlg::-webkit-scrollbar { width: 10px; }
+	      .dlg::-webkit-scrollbar-track { background: transparent; }
+	      .dlg::-webkit-scrollbar-thumb { background: rgba(0,0,0,.16); border-radius: 5px;
+	                                      border: 3px solid transparent;
+	                                      background-clip: content-box; }
+	      .dlg::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,.28);
+	                                            background-clip: content-box; }
+	      @media (max-width: 520px) {
+	        .row { flex-wrap: wrap; }
+	        .row .rl { flex: 1 1 100%; }
+	        .row .ctl, .row .ctl.narrow, .row .ctl.tiny { flex: 1 1 100%; margin-left: 0; }
+	        .row .chips { margin-left: 0; justify-content: flex-start; }
+	        .chkctl { margin-left: 0; }
+	      }
+
+	      @media (prefers-color-scheme: dark) {
+	        .dlg { --accent: #60cdff; --accent-hover: #7fd8ff; --accent-text: #003a4d;
+	               --stroke: rgba(255,255,255,.09); --stroke-strong: rgba(255,255,255,.20);
+	               --text: #f3f3f3; --text-2: #c7c7c7; --text-3: #9a9a9a;
+	               --field: rgba(255,255,255,.06); --card: rgba(255,255,255,.055);
+	               --inset: rgba(255,255,255,.05); --hover: rgba(255,255,255,.055);
+	               background: rgba(32,32,32,.94);
+	               box-shadow: 0 28px 72px rgba(0,0,0,.6), 0 2px 8px rgba(0,0,0,.35); }
+	        .hd { background: rgba(32,32,32,.97); }
+	        .hd .x:hover { background: rgba(255,153,164,.16); color: #ff99a4; }
+	        input:focus, select:focus, textarea:focus { background: rgba(255,255,255,.10); }
+	        input:hover, select:hover, textarea:hover { border-color: rgba(255,255,255,.32); }
+	        .ghost { background: rgba(255,255,255,.06); }
+	        .ghost:hover { background: rgba(255,255,255,.10); }
+	        .test { background: rgba(108,203,95,.14); color: #6ccb5f; }
+	        .test:hover { background: rgba(108,203,95,.20); }
+	        .chip:hover { background: rgba(255,255,255,.08); }
+	        .ft { background: rgba(32,32,32,.96); }
+	        .dlg::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18);
+	                                        background-clip: content-box; }
+	        .dlg::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.30);
+	                                              background-clip: content-box; }
+	        .status.ok { color: #6ccb5f; }
+	        .status.err { color: #ff99a4; }
+	        .status.warn { color: #f0b45a; }
+	      }
 	    </style>
 	    <div class="mask">
 	      <div class="dlg">
 	        <div class="hd">
-	          <span class="ttl"><span class="dot"></span><h3>模型配置</h3></span>
+	          <span class="ttl"><h3>高级设置</h3></span>
 	          <span class="x" id="close">×</span>
 	        </div>
 	        <div class="bd">
-	          <div class="sec">接口（OpenAI 兼容）</div>
-	          <div class="grid">
-	            <label>Base URL</label>
-	            <input type="text" id="baseUrl" placeholder="https://api.openai.com/v1">
-	            <div class="hint">通常以 /v1 结尾；脚本会自动补全 /chat/completions 或 /responses</div>
-
-	            <label>API Key</label>
-	            <input type="password" id="apiKey" placeholder="sk-...">
-	            <div class="hint">仅保存在本地浏览器存储中，不会上传到任何第三方</div>
-
-	            <label>模型</label>
-	            <input type="text" id="model" placeholder="gpt-4o / qwen-vl-max / glm-4v ...">
-	            <div class="hint">必须是支持图片输入的多模态模型（题目以位图发送）</div>
-
-	            <label>接口风格</label>
-	            <select id="apiStyle">
-	              <option value="chat">Chat Completions（/chat/completions）</option>
-	              <option value="responses">Responses API（/responses）</option>
-	            </select>
-
-	            <label>temperature</label>
-	            <input type="number" id="temperature" step="0.1" min="0" max="2">
-
-	            <label>max tokens</label>
-	            <input type="number" id="maxTokens" step="128" min="64">
-
-	            <label>额外请求头</label>
-	            <textarea id="extraHeaders" placeholder='{"X-Foo":"bar"}'></textarea>
+	          <div class="sec">作答设置</div>
+	          <div class="group">
+	            <div class="row">
+	              <span class="rl">作答题型</span>
+	              <div class="chips" id="types">
+	                <span class="chip on" data-type="单选" role="button" tabindex="0">单选题</span>
+	                <span class="chip on" data-type="多选" role="button" tabindex="0">多选题</span>
+	                <span class="chip on" data-type="判断" role="button" tabindex="0">判断题</span>
+	              </div>
+	            </div>
+	            <div class="row">
+	              <label class="rl" for="unknownAction">无答案时</label>
+	              <select class="ctl narrow" id="unknownAction">
+	                <option value="skip">留空不作答（默认）</option>
+	                <option value="guess">随机选一个（避免空题）</option>
+	              </select>
+	            </div>
 	          </div>
 
-	          <div class="sec">高级 <span class="opt">（日常使用保持默认即可）</span></div>
-	          <div class="grid">
-	            <label>无答案时</label>
-	            <select id="unknownAction">
-	              <option value="skip">留空不作答（默认）</option>
-	              <option value="guess">随机选一个（避免空题）</option>
-	            </select>
+	          <div class="sec">大模型设置</div>
+	          <div class="group">
+	            <div class="row">
+	              <label class="rl" for="baseUrl">Base URL</label>
+	              <input class="ctl" type="text" id="baseUrl" placeholder="https://api.openai.com/v1">
+	            </div>
+	            <div class="row">
+	              <label class="rl" for="apiKey">API Key</label>
+	              <input class="ctl" type="password" id="apiKey" placeholder="sk-...">
+	            </div>
+	            <div class="row">
+	              <label class="rl" for="model">模型</label>
+	              <input class="ctl" type="text" id="model" placeholder="gpt-4o / qwen-vl-max / glm-4v ...">
+	            </div>
+	            <div class="row">
+	              <label class="rl" for="apiStyle">接口风格</label>
+	              <select class="ctl narrow" id="apiStyle">
+	                <option value="chat">Chat Completions（/chat/completions）</option>
+	                <option value="responses">Responses API（/responses）</option>
+	              </select>
+	            </div>
+	            <div class="row">
+	              <label class="rl" for="temperature">Temperature</label>
+	              <input class="ctl tiny" type="number" id="temperature" step="0.1" min="0" max="2">
+	            </div>
+	            <div class="row">
+	              <label class="rl" for="maxTokens">Max tokens</label>
+	              <input class="ctl tiny" type="number" id="maxTokens" step="128" min="64">
+	            </div>
+	            <div class="row col">
+	              <label class="rl" for="extraHeaders">额外请求头</label>
+	              <textarea class="ctl" id="extraHeaders" placeholder='{"X-Foo":"bar"}'></textarea>
+	            </div>
+	          </div>
 
-	            <label>批量大小</label>
-	            <input type="number" id="llmBatchSize" min="1" max="20">
-	            <div class="hint">每次请求提交的题目数量；默认 1（逐题作答，日志最清晰）</div>
-
-	            <label>其他</label>
-	            <div class="chk"><input type="checkbox" id="debugDump"> 日志输出请求与响应原文（排错用）</div>
+	          <div class="sec">调试</div>
+	          <div class="group">
+	            <label class="row">
+	              <span class="rl">输出请求与响应原文</span>
+	              <input class="chkctl" type="checkbox" id="debugDump">
+	            </label>
 	          </div>
 	        </div>
 	        <div class="ft">
@@ -1700,8 +2140,8 @@
 				maxTokens: root.getElementById("maxTokens"),
 				extraHeaders: root.getElementById("extraHeaders"),
 				unknownAction: root.getElementById("unknownAction"),
-				llmBatchSize: root.getElementById("llmBatchSize"),
 				debugDump: root.getElementById("debugDump"),
+				types: root.getElementById("types"),
 				status: root.getElementById("status"),
 			};
 
@@ -1709,6 +2149,41 @@
 			root.getElementById("cancel").addEventListener("click", close);
 			root.getElementById("save").addEventListener("click", save);
 			root.getElementById("test").addEventListener("click", testConnection);
+
+			Array.from(fields.types.querySelectorAll(".chip")).forEach((chip) => {
+				const toggle = () => {
+					if (chip.classList.contains("on")) {
+						// 至少保留一种题型
+						const on = fields.types.querySelectorAll(".chip.on");
+						if (on.length <= 1) return;
+						chip.classList.remove("on");
+					} else {
+						chip.classList.add("on");
+					}
+				};
+				chip.addEventListener("click", toggle);
+				chip.addEventListener("keydown", (e) => {
+					if (e.key === "Enter" || e.key === " ") {
+						e.preventDefault();
+						toggle();
+					}
+				});
+			});
+		}
+
+		function syncChips(types) {
+			const map = types && typeof types === "object" ? types : ANSWER_DEFAULTS.types;
+			Array.from(fields.types.querySelectorAll(".chip")).forEach((chip) => {
+				chip.classList.toggle("on", map[chip.dataset.type] !== false);
+			});
+		}
+
+		function readTypes() {
+			const types = {};
+			Array.from(fields.types.querySelectorAll(".chip")).forEach((chip) => {
+				types[chip.dataset.type] = chip.classList.contains("on");
+			});
+			return types;
 		}
 
 		function fill(cfg, ans) {
@@ -1720,8 +2195,8 @@
 			fields.maxTokens.value = String(cfg.maxTokens);
 			fields.extraHeaders.value = cfg.extraHeaders || "";
 			fields.unknownAction.value = ans.unknownAction || "skip";
-			fields.llmBatchSize.value = String(cfg.batchSize || CFG.llmBatchSize);
 			fields.debugDump.checked = !!ans.debugDump;
+			syncChips(ans.types);
 			setStatus("", "");
 		}
 
@@ -1742,11 +2217,11 @@
 				maxTokens: parseInt(fields.maxTokens.value, 10) || 2048,
 				jsonMode: true,
 				extraHeaders: fields.extraHeaders.value.trim(),
-				batchSize: parseInt(fields.llmBatchSize.value, 10) || CFG.llmBatchSize,
 			};
 			const ans = {
 				unknownAction: fields.unknownAction.value,
 				debugDump: fields.debugDump.checked,
+				types: readTypes(),
 			};
 			return { cfg, ans };
 		}
@@ -1767,10 +2242,11 @@
 				return false;
 			}
 			store.set("llm", cfg);
-			// 只覆盖本弹窗负责的字段，其余（自动暂存 / 题型勾选等）保留面板上的设置
+			// 只覆盖本弹窗负责的字段，其余（自动暂存 / 跳过已作答等）保留面板上的设置
 			const merged = store.config("answer", ANSWER_DEFAULTS);
 			merged.unknownAction = ans.unknownAction;
 			merged.debugDump = ans.debugDump;
+			merged.types = ans.types;
 			store.set("answer", merged);
 			Panel.refreshBadges();
 			setStatus("已保存", "ok");
@@ -1824,6 +2300,8 @@
 		function open() {
 			ensure();
 			fill(store.config("llm", LLM_DEFAULTS), store.config("answer", ANSWER_DEFAULTS));
+			const dlg = root.querySelector(".dlg");
+			if (dlg) dlg.scrollTop = 0;
 			host.style.display = "";
 		}
 
@@ -1909,56 +2387,259 @@
 		);
 	}
 
-	/** 切换到指定课时（getTeacherAjax 为主，URL 整页跳转兜底） */
-	async function gotoLesson(lesson) {
+	/** 课程卡片 iframe 的地址（软导航兜底使用） */
+	function cardsUrl(kid, num0) {
 		const p = courseParams();
-		const fn = window.getTeacherAjax;
-		if (typeof fn === "function") {
-			Log.info("切换课时（AJAX）：" + lesson.title);
-			tagCardsWindowForReload();
-			fn(p.courseId, p.clazzid, lesson.kid, p.cpi);
-		} else {
-			Log.warn("页面导航函数不可用，使用整页跳转兜底");
+		return (
+			"/mooc-ans/knowledge/cards?clazzid=" +
+			encodeURIComponent(p.clazzid) +
+			"&courseid=" +
+			encodeURIComponent(p.courseId) +
+			"&knowledgeid=" +
+			encodeURIComponent(kid) +
+			"&num=" +
+			Math.max(0, num0 || 0) +
+			"&ut=s&cpi=" +
+			encodeURIComponent(p.cpi) +
+			"&mooc2=1&isMicroCourse=false&editorPreview=0"
+		);
+	}
+
+	// 导航方式一次选定后复用：避免每个课时都重复尝试 / 回退并刷屏
+	let NAV_MODE = ""; // "" | "ajax" | "soft" | "iframe"
+	const NAV_MODE_LABEL = {
+		ajax: "站点内置 AJAX 导航",
+		soft: "内容区软导航（studentstudyAjax）",
+		iframe: "内容 iframe 直切",
+	};
+
+	function resetNavMode() {
+		NAV_MODE = "";
+	}
+
+	function setNavMode(mode) {
+		if (NAV_MODE === mode) return;
+		const changed = !!NAV_MODE;
+		NAV_MODE = mode;
+		Log.useSystem();
+		Log.info(
+			(changed ? "课时切换方式变更：" : "课时切换方式：") +
+				NAV_MODE_LABEL[mode] +
+				"（页面不刷新）",
+		);
+	}
+
+	/** 递归暂停课程内容里的所有视频（含嵌套 iframe），避免切课后后台继续播放 */
+	function pauseCourseVideos(doc, depth) {
+		const d = doc || Dom.docOf(cardsIframeEl());
+		if (!d || (depth || 0) > 3) return;
+		Dom.toArray(d.querySelectorAll("video")).forEach((v) => {
+			try {
+				v.pause();
+			} catch (e) {
+				/* noop */
+			}
+		});
+		Dom.toArray(d.querySelectorAll("iframe")).forEach((f) => {
+			const inner = Dom.docOf(f);
+			if (inner) pauseCourseVideos(inner, (depth || 0) + 1);
+		});
+	}
+
+	/** 不刷新页面的课时切换：直接换卡片 iframe，并同步目录高亮/地址栏 */
+	function softActivateLesson(lesson) {
+		Dom.toArray(document.querySelectorAll("." + SEL.currentLessonActive)).forEach((el) =>
+			el.classList.remove(SEL.currentLessonActive),
+		);
+		const row =
+			document.getElementById("cur" + lesson.kid) || document.getElementById(lesson.kid);
+		if (row) row.classList.add(SEL.currentLessonActive);
+
+		["chapterId", "chapterIdid", "curChapterId"].forEach((id) => {
+			const el = document.getElementById(id);
+			if (el) el.value = lesson.kid;
+		});
+		try {
+			if (typeof window.chapterId !== "function") window.chapterId = lesson.kid;
+			if (typeof window.ai_stu_knowledgeId !== "function")
+				window.ai_stu_knowledgeId = lesson.kid;
+		} catch (e) {
+			/* noop */
+		}
+		try {
+			if (typeof window.updateLastStudyKnowledge === "function")
+				window.updateLastStudyKnowledge(lesson.kid);
+		} catch (e) {
+			/* noop */
+		}
+		try {
 			const u = new URL(location.href);
 			u.searchParams.set("chapterId", lesson.kid);
-			location.href = u.toString();
-			return; // 整页刷新后脚本重新初始化
+			history.replaceState(history.state, "", u.toString());
+		} catch (e) {
+			/* noop */
 		}
-		await waitFor(
-			() => {
-				const active = document.querySelector("." + SEL.currentLessonActive);
-				const f = cardsIframeEl();
-				const activeOk = active && active.id === "cur" + lesson.kid;
-				const iframeOk = f && (f.src || "").indexOf("knowledgeid=" + lesson.kid) !== -1;
-				return activeOk || iframeOk ? true : null;
-			},
-			{ timeout: CFG.navTimeout, interval: 500, desc: "课时切换生效" },
-		);
+	}
+
+	/** 拉取 studentstudyAjax 返回的内容区 HTML（不依赖页面全局 jQuery） */
+	async function fetchStudyHtml(lesson) {
+		const p = courseParams();
+		const apiBase =
+			typeof window._HOST_CP2_ === "string" && window._HOST_CP2_ ? window._HOST_CP2_ : "";
+		const params = new URLSearchParams({
+			courseId: p.courseId,
+			clazzid: p.clazzid,
+			chapterId: lesson.kid,
+			cpi: p.cpi,
+			verificationcode: "",
+			mooc2: "1",
+			toComputer: "false",
+			microTopicId: "0",
+			editorPreview: "0",
+			isPreviewVideo: "false",
+			videoWidth: "0",
+			videoHeight: "0",
+			targetVideoJobId: "",
+			cardIndex: "0",
+		});
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), 15000);
+		try {
+			const res = await fetch(apiBase + "/mycourse/studentstudyAjax?" + params.toString(), {
+				credentials: "same-origin",
+				signal: ctrl.signal,
+			});
+			if (!res.ok) throw new Error("HTTP " + res.status);
+			return await res.text();
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/** 用接口返回的 HTML 同步顶部卡片标签（多卡片课时不会因直切而漏处理） */
+	function syncCardTabsFromHtml(html) {
+		try {
+			const doc = new DOMParser().parseFromString(html, "text/html");
+			const src = doc.querySelector("#prev_tab");
+			const dst = document.querySelector("#prev_tab");
+			if (src && dst) dst.innerHTML = src.innerHTML;
+			return doc;
+		} catch (e) {
+			return null;
+		}
+	}
+
+	/** 直接切换卡片 iframe（不依赖站点脚本，页面不刷新） */
+	async function directNavigateLesson(lesson) {
+		const f = cardsIframeEl();
+		if (!f) throw new Error("未找到课程内容 iframe");
+		tagCardsWindowForReload();
+		f.src = cardsUrl(lesson.kid, 0);
+		softActivateLesson(lesson);
 		await waitForCardsReady(lesson.kid, 0, undefined, true);
 	}
 
-	/** 切换课时内卡片（changeDisplayContent 为主，直改 iframe src 兜底） */
-	async function switchCard(n, total, lesson) {
+	/**
+	 * 软导航：
+	 *  1. 优先复用站点的 studentstudyAjax 接口，把返回内容填回 #mainid
+	 *     （与 getTeacherAjax 同源同行为，但不依赖页面全局函数，且不会整页跳转；
+	 *      同时能刷新顶部卡片标签，避免多卡片课时被漏处理）
+	 *  2. 接口不可用时才直接改 #iframe 的 src，仍然不刷新整页
+	 */
+	async function softNavigateLesson(lesson) {
+		let html = null;
+		try {
+			html = await fetchStudyHtml(lesson);
+		} catch (e) {
+			/* 接口不可用：直接走 iframe 直切 */
+		}
+		const parsed = html ? syncCardTabsFromHtml(html) : null;
+		const newMain = parsed ? parsed.getElementById("mainid") : null;
+		const oldMain = document.getElementById("mainid");
+		const $ = window.jQuery;
+
+		if (newMain && oldMain && $ && typeof $.fn === "object") {
+			tagCardsWindowForReload();
+			try {
+				$(oldMain).html(newMain.innerHTML);
+			} catch (e) {
+				/* 注入失败则走直切 */
+			}
+			const f = cardsIframeEl();
+			if (f && (f.src || "").indexOf("knowledgeid=" + lesson.kid) !== -1) {
+				softActivateLesson(lesson);
+				await waitForCardsReady(lesson.kid, 0, undefined, true);
+				setNavMode("soft");
+				return;
+			}
+		}
+
+		await directNavigateLesson(lesson);
+		setNavMode("iframe");
+	}
+
+	/** 切换到指定课时：AJAX 导航优先，软导航 / iframe 兜底；任何情况下都不整页刷新 */
+	async function gotoLesson(lesson) {
+		pauseCourseVideos();
+		// 已确定可用的方式直接复用，避免每课都重复失败尝试
+		if (NAV_MODE === "soft") {
+			await softNavigateLesson(lesson);
+			return;
+		}
+		if (NAV_MODE === "iframe") {
+			await directNavigateLesson(lesson);
+			return;
+		}
+
 		const p = courseParams();
-		const fn = window.changeDisplayContent;
-		tagCardsWindowForReload();
+		const fn = window.getTeacherAjax;
 		if (typeof fn === "function") {
+			tagCardsWindowForReload();
+			try {
+				fn(p.courseId, p.clazzid, lesson.kid, p.cpi);
+				await waitFor(
+					() => {
+						const active = document.querySelector("." + SEL.currentLessonActive);
+						const f = cardsIframeEl();
+						const activeOk = active && active.id === "cur" + lesson.kid;
+						const iframeOk = f && (f.src || "").indexOf("knowledgeid=" + lesson.kid) !== -1;
+						return activeOk || iframeOk ? true : null;
+					},
+					{ timeout: CFG.navTimeout, interval: 500, desc: "课时切换生效" },
+				);
+				await waitForCardsReady(lesson.kid, 0, undefined, true);
+				setNavMode("ajax");
+				return;
+			} catch (e) {
+				if (e === STOP) throw e;
+				Log.warn("站点 AJAX 切课未生效，改用软导航");
+			}
+		}
+		await softNavigateLesson(lesson);
+	}
+
+	/** 切换课时内卡片（changeDisplayContent 为主，直改 iframe src 兜底；不刷新整页） */
+	async function switchCard(n, total, lesson) {
+		pauseCourseVideos();
+		const p = courseParams();
+		tagCardsWindowForReload();
+		const fn = window.changeDisplayContent;
+		if (NAV_MODE !== "iframe" && typeof fn === "function") {
 			Log.info("切换到卡片 " + n + " / " + total);
 			fn(n, total, lesson.kid, p.courseId, p.clazzid, "");
 		} else {
 			const f = cardsIframeEl();
-			if (f)
-				f.src =
-					"/mooc-ans/knowledge/cards?clazzid=" +
-					p.clazzid +
-					"&courseid=" +
-					p.courseId +
-					"&knowledgeid=" +
-					lesson.kid +
-					"&num=" +
-					(n - 1) +
-					"&ut=s&cpi=" +
-					p.cpi;
+			if (!f) throw new Error("未找到课程内容 iframe");
+			f.src = cardsUrl(lesson.kid, n - 1);
+			Dom.toArray(document.querySelectorAll(SEL.cardTabs)).forEach((li) => {
+				li.classList.remove("active");
+				if (li.id === "dct" + n) li.classList.add("active");
+			});
+			try {
+				if (typeof window.setChapterNumData === "function") window.setChapterNumData(n);
+			} catch (e) {
+				/* noop */
+			}
 		}
 		await waitForCardsReady(lesson.kid, n - 1, undefined, true);
 	}
@@ -2089,6 +2770,15 @@
 		}
 	}
 
+	function unhookReportCallback(vdoc) {
+		try {
+			const win = vdoc.defaultView;
+			if (win) win.__cxapOnPassed = null;
+		} catch (e) {
+			/* noop */
+		}
+	}
+
 	async function ensurePlay(video) {
 		if (!video.paused) return;
 		try {
@@ -2114,10 +2804,379 @@
 		return m + ":" + (s < 10 ? "0" : "") + s;
 	}
 
+	function fmtRate(rate) {
+		const n = Math.round(Number(rate) * 100) / 100;
+		return n + "x";
+	}
+
+	// ========================= 10.1 倍速能力探测 =========================
+
+	/** 从视频 iframe 中取 VideoJS 播放器实例（找不到则返回 null） */
+	function getVideoPlayer(vdoc) {
+		try {
+			const vw = vdoc.defaultView;
+			const vj = vw && vw.videojs;
+			if (typeof vj !== "function") return null;
+			const video = vdoc.querySelector("video");
+			let players = null;
+			try {
+				players = typeof vj.getPlayers === "function" ? vj.getPlayers() : vj.players;
+			} catch (e) {
+				players = vj.players;
+			}
+			const list = [];
+			if (players && typeof players === "object") {
+				Object.keys(players).forEach((k) => {
+					if (players[k] && typeof players[k] === "object") list.push(players[k]);
+				});
+			}
+			for (const p of list) {
+				try {
+					const el = typeof p.el === "function" ? p.el() : null;
+					if (el && (!video || el.contains(video))) return p;
+				} catch (e) {
+					/* noop */
+				}
+			}
+			return list[0] || null;
+		} catch (e) {
+			return null;
+		}
+	}
+
+	/** 读取播放器声明的可用倍速（优先播放器配置，其次解析倍速菜单项） */
+	function readRateOptions(vdoc, player) {
+		const out = [];
+		const push = (v) => {
+			const n = Number(v);
+			if (!isFinite(n) || n < 0.25 || n > 4) return;
+			if (!out.some((x) => Math.abs(x - n) < 0.001)) out.push(n);
+		};
+		try {
+			const rates =
+				player && player.options_ && Array.isArray(player.options_.playbackRates)
+					? player.options_.playbackRates
+					: null;
+			if (rates && rates.length) rates.forEach(push);
+		} catch (e) {
+			/* noop */
+		}
+		if (!out.length) {
+			Dom.toArray(
+				vdoc.querySelectorAll(".vjs-playback-rate .vjs-menu-content li, .vjs-menu-item"),
+			).forEach((li) => {
+				const txt = Dom.normText(li.textContent);
+				const m = txt.match(/^(\d+(?:\.\d+)?)\s*x/i);
+				if (m) push(parseFloat(m[1]));
+			});
+		}
+		return out.sort((a, b) => a - b);
+	}
+
+	/** 找倍速菜单中对应速率的菜单项（直接派发 click 可走播放器官方切换逻辑） */
+	function findRateMenuItem(vdoc, rate) {
+		const items = Dom.toArray(
+			vdoc.querySelectorAll(".vjs-playback-rate .vjs-menu-content li, .vjs-menu-item"),
+		);
+		for (const li of items) {
+			const m = Dom.normText(li.textContent).match(/^(\d+(?:\.\d+)?)\s*x/i);
+			if (m && Math.abs(parseFloat(m[1]) - rate) < 0.001) return li;
+		}
+		return null;
+	}
+
+	/** 当前生效倍速（播放器 API 优先，回退 video 元素） */
+	function currentPlaybackRate(video, player) {
+		try {
+			if (player && typeof player.playbackRate === "function") return player.playbackRate();
+		} catch (e) {
+			/* noop */
+		}
+		try {
+			return video.playbackRate;
+		} catch (e) {
+			return 1;
+		}
+	}
+
+	/** 应用倍速：优先点击官方菜单项，再同步播放器 API 与原生 video 属性 */
+	function applyPlaybackRate(vdoc, video, player, rate) {
+		let viaMenu = false;
+		const item = findRateMenuItem(vdoc, rate);
+		if (item) {
+			try {
+				item.click();
+				viaMenu = true;
+			} catch (e) {
+				/* noop */
+			}
+		}
+		try {
+			if (player && typeof player.playbackRate === "function") player.playbackRate(rate);
+			else video.playbackRate = rate;
+		} catch (e) {
+			/* noop */
+		}
+		try {
+			video.playbackRate = rate;
+		} catch (e) {
+			/* noop */
+		}
+		return viaMenu;
+	}
+
+	/** 播放器当前可见的“禁止倍速”提示（站点用 toolTipBox1 显示 rateTip / eryaRateTip） */
+	function visibleRateTip(vdoc) {
+		const sel = ".toolTipBox1, .toolTipBox1_1, .toolTipBox2, .ans-vjserrdisplay";
+		const nodes = Dom.toArray(vdoc.querySelectorAll(sel));
+		for (const el of nodes) {
+			const txt = Dom.normText(el.textContent);
+			if (txt.indexOf("倍速") === -1) continue;
+			try {
+				const cs = vdoc.defaultView.getComputedStyle(el);
+				if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") continue;
+				if (el.getBoundingClientRect().height > 0) return txt;
+			} catch (e) {
+				/* noop */
+			}
+		}
+		return "";
+	}
+
+	/**
+	 * 倍速控制器：
+	 *  - 从播放器配置/倍速菜单读取课程实际开放的档位，逐档从高到低尝试
+	 *  - 应用后持续观察：被重置或出现“禁止倍速”提示 → 判定不可用并回退 1x
+	 *  - 播放暂停恢复、媒体源重载后自动重新应用（有限次数，避免与站点限制互相拉扯）
+	 */
+	function createSpeedController(vdoc, video, cardKey) {
+		const player = getVideoPlayer(vdoc);
+		const pref = store.config("video", VIDEO_DEFAULTS);
+		let desired = 1; // 当前希望维持的倍速；1 表示不干预
+		let blocked = false;
+		let reapplyCount = 0;
+		let lastApplyAt = 0;
+		let stableSince = 0;
+		let disposed = false;
+
+		const videoEl = () => vdoc.querySelector("video") || video;
+		const logLine = (level, msg) => {
+			Log.use(cardKey);
+			Log[level](msg);
+		};
+
+		try {
+			if (player) player.videoAutoPlay = 0; // 关闭站点自动连播，避免与脚本切课竞争
+		} catch (e) {
+			/* noop */
+		}
+
+		async function observe(rate, windowMs) {
+			await sleep(CFG.rateProbeDelay);
+			const start = Date.now();
+			while (Date.now() - start < windowMs) {
+				if (S.stopRequested) throw STOP;
+				if (visibleRateTip(vdoc)) return "blocked";
+				if (Math.abs(currentPlaybackRate(videoEl(), player) - rate) > 0.01) return "reset";
+				await sleep(220);
+			}
+			return "ok";
+		}
+
+		function block(reason) {
+			blocked = true;
+			desired = 1;
+			reapplyCount = 0;
+			applyPlaybackRate(vdoc, videoEl(), player, 1);
+			logLine("warn", "该视频不允许倍速（" + reason + "），已回退 1x 播放");
+		}
+
+		/** 探测并开启最高可用倍速；返回最终生效倍速 */
+		async function arm() {
+			if (!pref.autoRate) {
+				logLine("info", "自动倍速已关闭，按 1x 播放");
+				return 1;
+			}
+			const options = readRateOptions(vdoc, player);
+			const candidates = options.filter((r) => r > 1).sort((a, b) => b - a);
+			if (!candidates.length) {
+				logLine("skip", "未检测到可用倍速选项，保持 1x 播放");
+				return 1;
+			}
+			logLine(
+				"info",
+				"检测到倍速档位：" + options.map(fmtRate).join(" / ") + "，尝试最高档",
+			);
+			const tried = candidates.slice(0, 3);
+			for (const rate of tried) {
+				if (S.stopRequested) throw STOP;
+				logLine("info", "尝试 " + fmtRate(rate) + " 播放");
+				applyPlaybackRate(vdoc, videoEl(), player, rate);
+				lastApplyAt = Date.now();
+				const verdict = await observe(rate, CFG.rateSettleTimeout);
+				if (verdict === "ok") {
+					desired = rate;
+					reapplyCount = 0;
+					stableSince = Date.now();
+					logLine("ok", "已开启 " + fmtRate(rate) + " 倍速播放");
+					return rate;
+				}
+				if (verdict === "blocked") {
+					block("播放器提示不可启用倍速");
+					return 1;
+				}
+				logLine("warn", fmtRate(rate) + " 被播放器重置，继续尝试较低档位");
+			}
+			block("可用档位均被播放器重置");
+			return 1;
+		}
+
+		/** 播放中巡检：倍速被站点重置时先重试，反复重置则判定不支持 */
+		function maintain() {
+			if (disposed || blocked || desired <= 1) return;
+			if (visibleRateTip(vdoc)) {
+				block("播放器提示不可启用倍速");
+				return;
+			}
+			const cur = currentPlaybackRate(videoEl(), player);
+			if (Math.abs(cur - desired) < 0.01) {
+				if (!stableSince) stableSince = Date.now();
+				// 连续稳定 60s 才清零重试计数，避免「重置→重应用→再重置」无限循环
+				else if (Date.now() - stableSince > 60000) reapplyCount = 0;
+				return;
+			}
+			stableSince = 0;
+			if (Date.now() - lastApplyAt < 1500) return; // 刚应用，给播放器留出稳定时间
+			if (reapplyCount >= CFG.rateReapplyLimit) {
+				block("倍速被反复重置");
+				return;
+			}
+			reapplyCount++;
+			applyPlaybackRate(vdoc, videoEl(), player, desired);
+			lastApplyAt = Date.now();
+			logLine("warn", "倍速被重置，已重新应用 " + fmtRate(desired) + "（" + reapplyCount + "/" + CFG.rateReapplyLimit + "）");
+		}
+
+		/** 暂停恢复后立即恢复倍速（不触发完整探测） */
+		function onResume() {
+			if (disposed || blocked || desired <= 1) return;
+			applyPlaybackRate(vdoc, videoEl(), player, desired);
+			lastApplyAt = Date.now();
+		}
+
+		const onLoadStart = () => {
+			if (disposed || blocked || desired <= 1) return;
+			// 媒体源切换/线路重载会把倍速重置为 1，延迟一点再应用
+			setTimeout(() => {
+				if (disposed || blocked || desired <= 1) return;
+				applyPlaybackRate(vdoc, videoEl(), player, desired);
+				lastApplyAt = Date.now();
+			}, 350);
+		};
+		try {
+			video.addEventListener("loadstart", onLoadStart);
+		} catch (e) {
+			/* noop */
+		}
+
+		function pause() {
+			try {
+				if (player && typeof player.pause === "function") player.pause();
+			} catch (e) {
+				/* noop */
+			}
+			try {
+				const v = videoEl();
+				if (v) v.pause();
+			} catch (e) {
+				/* noop */
+			}
+		}
+
+		function dispose() {
+			disposed = true;
+			try {
+				video.removeEventListener("loadstart", onLoadStart);
+			} catch (e) {
+				/* noop */
+			}
+		}
+
+		return {
+			arm,
+			maintain,
+			onResume,
+			pause,
+			dispose,
+			getRate: () => currentPlaybackRate(videoEl(), player),
+		};
+	}
+
+	/** 检测视频内弹题/互动弹窗（可能渲染在视频文档或外层卡片文档） */
+	function detectVideoPopup(vdoc, containerDoc) {
+		const docs = [vdoc, containerDoc].filter(Boolean);
+		const sels = ["#topicList", "#topicType", "#topicContent", ".videoquiz", ".ans-videoquiz"];
+		for (const d of docs) {
+			for (const sel of sels) {
+				let nodes = [];
+				try {
+					nodes = Dom.toArray(d.querySelectorAll(sel));
+				} catch (e) {
+					continue;
+				}
+				for (const el of nodes) {
+					if (!Dom.isVisible(el)) continue;
+					const txt = Dom.normText(el.textContent);
+					if (txt.length >= 4 || el.querySelector("input,button,.option,.answer,.TiMu"))
+						return el;
+				}
+			}
+		}
+		return null;
+	}
+
+	/** 暂停并等待站点完成最后一次进度上报，避免切课时中断请求触发页面重载 */
+	async function pauseAndSettle(video, speedCtl) {
+		try {
+			if (speedCtl) speedCtl.pause();
+		} catch (e) {
+			/* noop */
+		}
+		try {
+			if (video) video.pause();
+		} catch (e) {
+			/* noop */
+		}
+		await sleep(CFG.navSettleDelay);
+	}
+
+	/** 运行时关闭站点自身的自动连播（顶层变量），停止时恢复 */
+	function disableSiteAutoNext() {
+		try {
+			if (!Object.prototype.hasOwnProperty.call(window, "__cxapAutoNextSaved")) {
+				window.__cxapAutoNextSaved = window.videoAutoPlay;
+			}
+			window.videoAutoPlay = 0;
+		} catch (e) {
+			/* noop */
+		}
+	}
+
+	function restoreSiteAutoNext() {
+		try {
+			if (Object.prototype.hasOwnProperty.call(window, "__cxapAutoNextSaved")) {
+				window.videoAutoPlay = window.__cxapAutoNextSaved;
+				delete window.__cxapAutoNextSaved;
+			}
+		} catch (e) {
+			/* noop */
+		}
+	}
+
 	/** 处理单个视频任务点（完成时返回判定来源） */
-	async function handleVideoTask(job) {
+	async function handleVideoTask(job, cardKey) {
 		if (!job.iframe) throw new Error("未找到视频载体 iframe");
-		const cardKey = "v:" + (job.jobid || job.title);
+		cardKey = cardKey || "v:" + (job.jobid || job.title);
 
 		// A. 等待视频框与 video 元素
 		const vdoc = await waitFor(
@@ -2135,140 +3194,212 @@
 		);
 
 		const video = vdoc.querySelector("video");
+		const popupDoc = (job.iframe && job.iframe.ownerDocument) || vdoc;
 
 		// B. 安装完成信号（事件驱动优先）
 		const signals = { passed: false, iconDone: false };
 		installReportHook(vdoc, () => {
 			signals.passed = true;
 		});
-		watchIconDone(job.icon, () => {
+		let iconObs = watchIconDone(job.icon, () => {
 			signals.iconDone = true;
 		});
-		if (isIconDone(job.icon) || signals.iconDone) return "taskpoint"; // 进入时已完成（如上次异常退出）
+		let speedCtl = null;
 
-		// C. 先启动播放，锁定 1 倍速。
-		//    实测：VideoJS 惰性加载，未播放时 duration 为 null，必须先 play 元数据才会就绪。
 		try {
-			video.playbackRate = 1;
-		} catch (e) {
-			/* noop */
-		}
-		video.muted = !!store.get("mute", false);
-		await ensurePlay(video);
-		Log.use(cardKey);
-		Log.info("开始播放");
-		Log.meta(null, "播放中", "run");
+			if (isIconDone(job.icon) || signals.iconDone) return "taskpoint"; // 进入时已完成（如上次异常退出）
 
-		// D. 等待播放真正就绪（元数据加载或进度开始走）
-		await waitFor(
-			() => (isFinite(video.duration) && video.duration > 0) || video.currentTime > 0,
-			{ timeout: 60000, interval: 500, desc: "视频开始加载" },
-		);
-		if (isFinite(video.duration) && video.duration > 0) {
+			// C. 先以 1x 启动播放。实测：VideoJS 惰性加载，未播放时 duration 为 null。
+			try {
+				video.playbackRate = 1;
+			} catch (e) {
+				/* noop */
+			}
+			video.muted = !!store.get("mute", false);
+			await ensurePlay(video);
 			Log.use(cardKey);
-			Log.info("时长 " + fmtTime(video.duration) + "，完成条件：观看 ≥ 总时长的 90%");
-		}
+			Log.info("开始播放");
 
-		// E. 监控循环（1s 兜底轮询 + 事件信号）
-		//    进度看门狗：实测暂停可能高频发生（CDN 抖动导致媒体源重载，不经过 video.pause()），
-		//    因此不按"暂停次数"判失败，而是只要 currentTime 持续推进就一直恢复；
-		//    只有长时间零进度才判定失败（重试→跳过）。
-		let lastPct = -1,
-			lastLogAt = 0,
-			pauseResumes = 0;
-		let progressAnchor = { t: video.currentTime, at: Date.now() };
-		for (;;) {
-			if (S.stopRequested) throw STOP;
-			await sleep(CFG.monitorInterval);
-
-			const v = vdoc.querySelector("video") || video;
-
-			// 完成判定 1：任务点状态（图标 aria-label / 上报响应 isPassed）
-			if (signals.passed || vdoc.__cxapPassed || signals.iconDone || isIconDone(job.icon)) {
+			// D. 等待播放真正就绪（元数据加载或进度开始走）
+			await waitFor(
+				() => (isFinite(video.duration) && video.duration > 0) || video.currentTime > 0,
+				{ timeout: 60000, interval: 500, desc: "视频开始加载" },
+			);
+			if (isFinite(video.duration) && video.duration > 0) {
 				Log.use(cardKey);
-				Log.info(
-					"检测到完成（" +
-						(signals.passed || vdoc.__cxapPassed ? "服务端 isPassed" : "页面任务点状态") +
-						"）",
-				);
-				return "taskpoint";
+				Log.info("时长 " + fmtTime(video.duration) + "，完成条件：观看 ≥ 总时长的 90%");
 			}
 
-			// 完成判定 2：视频播放完成 → 等待任务点状态同步
-			if (
-				v.ended ||
-				(isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 1.5)
-			) {
-				Log.use(cardKey);
-				Log.info("播放完成，等待任务点状态更新…");
-				let ok = false;
-				try {
-					ok = await waitFor(
-						() =>
-							signals.passed ||
-							vdoc.__cxapPassed ||
-							signals.iconDone ||
-							isIconDone(job.icon),
-						{ timeout: CFG.endedGraceTimeout, interval: 800, desc: "任务点状态同步" },
-					);
-				} catch (e) {
-					if (e === STOP) throw e;
-				}
-				if (ok) {
+			// E. 倍速探测（自动选择课程允许的最高档；不可用时回退 1x）
+			speedCtl = createSpeedController(vdoc, video, cardKey);
+			await speedCtl.arm();
+
+			// F. 监控循环（1s 兜底轮询 + 事件信号）
+			//    进度看门狗：实测暂停可能高频发生（CDN 抖动导致媒体源重载，不经过 video.pause()），
+			//    因此不按"暂停次数"判失败，而是只要 currentTime 持续推进就一直恢复；
+			//    只有长时间零进度才判定失败（重试→跳过）。
+			let lastPct = -1,
+				lastLogAt = 0,
+				pauseResumes = 0,
+				popupSince = 0;
+			let progressAnchor = { t: video.currentTime, at: Date.now() };
+			for (;;) {
+				if (S.stopRequested) throw STOP;
+				await sleep(CFG.monitorInterval);
+
+				const v = vdoc.querySelector("video") || video;
+
+				// 完成判定 1：任务点状态（图标 aria-label / 上报响应 isPassed）
+				if (signals.passed || vdoc.__cxapPassed || signals.iconDone || isIconDone(job.icon)) {
+					const viaPassed = signals.passed || vdoc.__cxapPassed;
+					await pauseAndSettle(v, speedCtl);
 					Log.use(cardKey);
-					Log.info("检测到任务点完成");
+					Log.info("检测到完成（" + (viaPassed ? "服务端 isPassed" : "页面任务点状态") + "）");
 					return "taskpoint";
 				}
-				Log.use(cardKey);
-				Log.warn("任务点状态未更新，按视频播放完成处理（ended 兜底）");
-				return "ended";
-			}
 
-			// 异常：播放出错
-			if (v.error) throw new Error("视频播放出错（code=" + v.error.code + "）");
-
-			// 进度看门狗：currentTime 在推进则刷新锚点，否则计时
-			if (v.currentTime > progressAnchor.t + 0.5) {
-				progressAnchor = { t: v.currentTime, at: Date.now() };
-			} else if (Date.now() - progressAnchor.at > CFG.noProgressTimeout) {
-				throw new Error(
-					"视频超过 " +
-						Math.round(CFG.noProgressTimeout / 60000) +
-						" 分钟无进度推进（持续网络异常或交互阻塞），放弃该任务点",
-				);
-			}
-
-			// 播放被暂停 → 自动恢复（不依赖暂停原因：失焦/CDN 重载/弹题均覆盖）
-			if (v.paused) {
-				if (pauseResumes >= CFG.maxPauseResumes) {
-					throw new Error("视频反复暂停，已达到恢复上限（" + CFG.maxPauseResumes + " 次）");
+				// 完成判定 2：视频播放完成 → 等待任务点状态同步
+				if (
+					v.ended ||
+					(isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 1.5)
+				) {
+					Log.use(cardKey);
+					Log.info("播放完成，等待任务点状态更新…");
+					let ok = false;
+					try {
+						ok = await waitFor(
+							() =>
+								signals.passed ||
+								vdoc.__cxapPassed ||
+								signals.iconDone ||
+								isIconDone(job.icon),
+							{ timeout: CFG.endedGraceTimeout, interval: 800, desc: "任务点状态同步" },
+						);
+					} catch (e) {
+						if (e === STOP) throw e;
+					}
+					await pauseAndSettle(v, speedCtl);
+					if (ok) {
+						Log.use(cardKey);
+						Log.info("检测到任务点完成");
+						return "taskpoint";
+					}
+					Log.use(cardKey);
+					Log.warn("任务点状态未更新，按视频播放完成处理（ended 兜底）");
+					return "ended";
 				}
-				pauseResumes++;
-				Log.use(cardKey);
-				Log.warn("检测到视频被暂停，自动恢复播放（第 " + pauseResumes + " 次）");
+
+				// 异常：播放出错
+				if (v.error) throw new Error("视频播放出错（code=" + v.error.code + "）");
+
+				// 视频内弹题：站点会暂停播放并等待作答；此脚本不代答，只明确等待并暂停进度看门狗
+				const popup = detectVideoPopup(vdoc, popupDoc);
+				if (popup) {
+					if (!popupSince) {
+						popupSince = Date.now();
+						Log.use(cardKey);
+						Log.warn(
+							"检测到视频内弹题/互动弹窗，已暂停进度判定，请手动作答后继续（最长等待 " +
+								Math.round(CFG.videoPopupWait / 60000) +
+								" 分钟）",
+						);
+					}
+					progressAnchor = { t: v.currentTime, at: Date.now() };
+					Panel.setTask("视频内弹题：请手动作答");
+					if (Date.now() - popupSince > CFG.videoPopupWait) {
+						throw new Error(
+							"视频内弹题超过 " +
+								Math.round(CFG.videoPopupWait / 60000) +
+								" 分钟未处理，放弃该任务点",
+						);
+					}
+					continue;
+				}
+				if (popupSince) {
+					popupSince = 0;
+					Log.use(cardKey);
+					Log.info("视频内弹题已处理，继续播放");
+				}
+
+				// 倍速巡检：被站点重置时重试/回退
 				try {
-					v.playbackRate = 1;
+					speedCtl.maintain();
+				} catch (e) {
+					/* 倍速维护失败不影响播放 */
+				}
+
+				// 进度看门狗：currentTime 在推进则刷新锚点，否则计时
+				if (v.currentTime > progressAnchor.t + 0.5) {
+					progressAnchor = { t: v.currentTime, at: Date.now() };
+				} else if (Date.now() - progressAnchor.at > CFG.noProgressTimeout) {
+					throw new Error(
+						"视频超过 " +
+							Math.round(CFG.noProgressTimeout / 60000) +
+							" 分钟无进度推进（持续网络异常或交互阻塞），放弃该任务点",
+					);
+				}
+
+				// 播放被暂停 → 自动恢复（不依赖暂停原因：失焦/CDN 重载/弹题均覆盖）
+				if (v.paused) {
+					if (pauseResumes >= CFG.maxPauseResumes) {
+						throw new Error("视频反复暂停，已达到恢复上限（" + CFG.maxPauseResumes + " 次）");
+					}
+					pauseResumes++;
+					Log.use(cardKey);
+					Log.warn("检测到视频被暂停，自动恢复播放（第 " + pauseResumes + " 次）");
+					v.muted = !!store.get("mute", false);
+					await ensurePlay(v);
+					try {
+						speedCtl.onResume();
+					} catch (e) {
+						/* noop */
+					}
+					continue;
+				}
+
+				// 进度展示与节流日志（元数据未就绪时仅显示已播放时间）
+				const hasDur = isFinite(v.duration) && v.duration > 0;
+				const pct = hasDur ? Math.min(99, Math.floor((v.currentTime / v.duration) * 100)) : -1;
+				const rate = speedCtl ? speedCtl.getRate() : 1;
+				Panel.setTask(
+					pct >= 0
+						? "播放中 " +
+								pct +
+								"%（" +
+								fmtTime(v.currentTime) +
+								" / " +
+								fmtTime(v.duration) +
+								(rate > 1 ? "，" + fmtRate(rate) : "") +
+								"）"
+						: "播放中（" + fmtTime(v.currentTime) + (rate > 1 ? "，" + fmtRate(rate) : "") + "）",
+				);
+				if (pct >= 0 && pct !== lastPct && Date.now() - lastLogAt > CFG.progressLogInterval) {
+					lastPct = pct;
+					lastLogAt = Date.now();
+					Log.use(cardKey);
+					Log.info("播放进度：" + pct + "%" + (rate > 1 ? "（" + fmtRate(rate) + "）" : ""));
+				}
+			}
+		} finally {
+			unhookReportCallback(vdoc);
+			try {
+				if (speedCtl) speedCtl.dispose();
+			} catch (e) {
+				/* noop */
+			}
+			if (iconObs) {
+				try {
+					iconObs.disconnect();
 				} catch (e) {
 					/* noop */
 				}
-				v.muted = !!store.get("mute", false);
-				await ensurePlay(v);
-				continue;
+				S.observers = S.observers.filter((o) => o !== iconObs);
+				iconObs = null;
 			}
-
-			// 进度展示与节流日志（元数据未就绪时仅显示已播放时间）
-			const hasDur = isFinite(v.duration) && v.duration > 0;
-			const pct = hasDur ? Math.min(99, Math.floor((v.currentTime / v.duration) * 100)) : -1;
-			Panel.setTask(
-				pct >= 0
-					? "播放中 " + pct + "%（" + fmtTime(v.currentTime) + " / " + fmtTime(v.duration) + "）"
-					: "播放中（" + fmtTime(v.currentTime) + "）",
-			);
-			if (pct >= 0 && pct !== lastPct && Date.now() - lastLogAt > CFG.progressLogInterval) {
-				lastPct = pct;
-				lastLogAt = Date.now();
-				Log.use(cardKey);
-				Log.info("播放进度：" + pct + "%");
+			try {
+				if (video) video.pause();
+			} catch (e) {
+				/* noop */
 			}
 		}
 	}
@@ -3992,7 +5123,7 @@
 		 *       最终提交必须由用户在学习通页面上手动点击「提交」。
 		 * @returns {Promise<{status:'done'|'skipped'|'failed', total:number, filled:number, failed:number, blank:number, saved:boolean}>}
 		 */
-		async function run(job, ansCfg) {
+		async function run(job, ansCfg, cardKey) {
 			const cfg = store.config("llm", LLM_DEFAULTS);
 			if (!ansCfg.enabled) {
 				Log.skip("跳过答题任务点「" + job.title + "」（自动答题已关闭）");
@@ -4007,14 +5138,16 @@
 			// A. 定位题目文档
 			const doc = await acquireDoc(job);
 
-			// 答题任务点独立一张卡片
-			const jobKey = "job:" + (job.jobid || job.title);
-			Log.use(jobKey, {
-				kind: "job",
-				title: "答题任务点 · " + job.title,
-				badge: "分析中",
-				badgeCls: "run",
-			});
+			// 答题任务点：默认独立建卡；由主流程传入课时卡片时并入课时日志
+			const jobKey = cardKey || "job:" + (job.jobid || job.title);
+			if (cardKey) Log.use(jobKey);
+			else
+				Log.use(jobKey, {
+					kind: "job",
+					title: "答题任务点 · " + job.title,
+					badge: "分析中",
+					badgeCls: "run",
+				});
 
 			// B. 解析题目
 			const all = Extract.parseAll(doc);
@@ -4239,24 +5372,17 @@
 		}
 	}
 
-	/** 单个视频任务点：有限重试 → 仍失败则记 ERROR 跳过（不中断整体） */
-	async function processVideoWithRetry(job) {
-		const cardKey = "v:" + (job.jobid || job.title);
+	/** 单个视频任务点：有限重试 → 仍失败则记 ERROR 跳过（不中断整体）；返回是否完成 */
+	async function processVideoWithRetry(job, cardKey) {
 		let lastErr = null;
 		for (let attempt = 1; attempt <= CFG.maxJobRetries; attempt++) {
 			if (S.stopRequested) throw STOP;
 			try {
-				Log.use(cardKey, {
-					kind: "video",
-					title: "视频任务点 · " + job.title,
-					badge: "播放中",
-					badgeCls: "run",
-				});
+				Log.use(cardKey);
 				Panel.setStatus("运行中");
 				Panel.setTask("分析视频：" + job.title);
-				const via = await handleVideoTask(job);
+				const via = await handleVideoTask(job, cardKey);
 				S.videoDone++;
-				Panel.setTaskStat();
 				Panel.setTask("当前视频任务点完成");
 				Log.use(cardKey);
 				Log.ok(
@@ -4264,8 +5390,7 @@
 						(via === "taskpoint" ? "学习通任务点状态" : "视频播放结束") +
 						"）",
 				);
-				Log.meta(null, "已完成", "ok");
-				return;
+				return true;
 			} catch (e) {
 				if (e === STOP) throw e;
 				lastErr = e;
@@ -4283,22 +5408,23 @@
 		Log.use(cardKey);
 		Panel.setStatus("异常");
 		Log.error("重试后仍未完成，跳过并继续后续任务（" + (lastErr && lastErr.message) + "）");
-		Log.meta(null, "已跳过", "err");
 		await sleep(1500); // 给用户看清日志
+		return false;
 	}
 
-	/** 单个答题任务点：有限重试 → 仍失败则记 ERROR 跳过 */
-	async function processAnswerWithRetry(job) {
+	/** 单个答题任务点：有限重试 → 仍失败则记 ERROR 跳过；返回是否完成 */
+	async function processAnswerWithRetry(job, cardKey) {
 		const ansCfg = store.config("answer", ANSWER_DEFAULTS);
-		const cardKey = "job:" + (job.jobid || job.title);
+		const jobKey = cardKey || "job:" + (job.jobid || job.title);
 		let lastErr = null;
 		for (let attempt = 1; attempt <= CFG.maxJobRetries; attempt++) {
 			if (S.stopRequested) throw STOP;
 			try {
+				Log.use(jobKey);
 				Panel.setStatus("运行中");
 				Panel.setTask("分析答题：" + job.title);
-				const stat = await AnswerTask.run(job, ansCfg);
-				if (stat.status === "skipped") return;
+				const stat = await AnswerTask.run(job, ansCfg, cardKey);
+				if (stat.status === "skipped") return true;
 				if (stat.status === "aborted") {
 					// 环境/配置类问题：重试无意义，直接抛出以停止整个任务
 					throw new Error("模型请求环境不可用，已中止答题（详见日志）");
@@ -4308,16 +5434,12 @@
 					throw lastErr;
 				}
 				S.answerDone++;
-				Panel.setAnswerStat();
 				Panel.setTask("当前答题任务点完成");
-				return;
+				return true;
 			} catch (e) {
 				if (e === STOP) throw e;
 				lastErr = e;
-				Log.use(cardKey, {
-					kind: "job",
-					title: "答题任务点 · " + job.title,
-				});
+				Log.use(jobKey);
 				Log.error(
 					"处理异常（第 " + attempt + "/" + CFG.maxJobRetries + " 次）：" + ((e && e.message) || e),
 				);
@@ -4328,11 +5450,11 @@
 				}
 			}
 		}
-		Log.use(cardKey);
+		Log.use(jobKey);
 		Panel.setStatus("异常");
 		Log.error("重试后仍未完成，跳过并继续后续任务（" + (lastErr && lastErr.message) + "）");
-		Log.meta(null, "已跳过", "err");
 		await sleep(1500);
+		return false;
 	}
 
 	async function run() {
@@ -4342,18 +5464,21 @@
 		S.answerSeen = 0;
 		S.answerDone = 0;
 		S.lessonIdx = -1;
-		Panel.setTaskStat();
-		Panel.setAnswerStat();
 		Panel.setTask("准备中");
-		// 新一轮运行：清空上一轮的日志卡片，避免混淆
+		// 新一轮运行：清空上一轮的日志卡片与导航方式缓存
 		Panel.clearCards();
+		resetNavMode();
 		Log.useSystem();
 
 		const ansCfg = store.config("answer", ANSWER_DEFAULTS);
 		const llmCfg = store.config("llm", LLM_DEFAULTS);
-		if (ansCfg.enabled && (!llmCfg.apiKey || !llmCfg.model)) {
-			Log.warn("自动答题已开启但 LLM 未配置，答题任务点将被跳过（请在面板「配置…」中设置）");
+		const llmReady = !!(llmCfg.apiKey && llmCfg.model);
+		const answerEnabled = !!ansCfg.enabled && llmReady;
+		if (ansCfg.enabled && !llmReady) {
+			Log.warn("自动答题已开启但 LLM 未配置，本次将直接跳过答题任务点（请在「高级设置」中配置）");
 		}
+		// 运行期间关闭站点自身的自动连播，避免与脚本切课竞争导致页面跳转/重载
+		disableSiteAutoNext();
 
 		// ---- SCANNING：扫描课程目录 ----
 		Panel.setStatus("运行中");
@@ -4370,36 +5495,64 @@
 			Log.warn("未识别当前课时，从第一个课时开始");
 		}
 
-		// ---- 逐课时处理 ----
+		let skippedLessons = 0;
+
+		// ---- 逐课时处理（每个课时一张独立卡片） ----
 		for (let i = idx; i < S.lessons.length; i++) {
 			if (S.stopRequested) throw STOP;
 			const lesson = S.lessons[i];
 			S.lessonIdx = i;
 			Panel.setLesson(i + 1 + " / " + S.lessons.length + "　" + lesson.title);
-			Log.info("进入：" + lesson.title + "（" + (i + 1) + "/" + S.lessons.length + "）");
 
-			// 整课时已无未完成任务点（渲染快照）→ 快速跳过
+			// 整课时已无未完成任务点（渲染快照）→ 快速跳过，不建卡片避免日志刷屏
 			if (lesson.unfinished === 0) {
-				Log.skip("该课时全部任务点已完成，跳过");
+				skippedLessons++;
 				continue;
 			}
+
+			const lessonKey = "lesson:" + lesson.kid;
+			let lessonKind = ""; // video | answer | mixed
+			let lessonHadError = false;
+			let lessonJobCount = 0;
+
+			const markLessonKind = (kind) => {
+				const next = !lessonKind ? kind : lessonKind === kind ? kind : "mixed";
+				if (next === lessonKind) return;
+				lessonKind = next;
+				Log.use(lessonKey);
+				if (next === "mixed") Log.meta("课时任务", undefined, undefined, "sys");
+				else if (next === "video") Log.meta("视频任务", undefined, undefined, "video");
+				else Log.meta("答题任务", undefined, undefined, "job");
+			};
+
+			Log.use(lessonKey, {
+				kind: "video",
+				title: "课时任务",
+				badge: "进行中",
+				badgeCls: "run",
+			});
+			Log.info("进入：" + lesson.title + "（" + (i + 1) + "/" + S.lessons.length + "）");
 
 			// 页面不在该课时 → 切换
 			const active = document.querySelector("." + SEL.currentLessonActive);
 			const onLesson =
 				(active && active.id === "cur" + lesson.kid) ||
 				(cardsIframeEl() && (cardsIframeEl().src || "").indexOf("knowledgeid=" + lesson.kid) !== -1);
-			if (!onLesson) await gotoLesson(lesson);
+			if (!onLesson) {
+				await gotoLesson(lesson);
+				Log.use(lessonKey); // 导航方式首次确定时会写入系统卡片
+			}
 
 			// 该课时包含的所有卡片依次处理
 			const tabCount = document.querySelectorAll(SEL.cardTabs).length;
 			const total = Math.max(tabCount, 1);
-			let lessonJobCount = 0;
 
 			for (let n = 1; n <= total; n++) {
 				if (S.stopRequested) throw STOP;
+				Log.use(lessonKey);
 				if (n > 1) await switchCard(n, total, lesson);
 				const doc = await waitForCardsReady(lesson.kid, n - 1);
+				Log.use(lessonKey);
 
 				// ---- ANALYZE_TASKS ----
 				const jobs = scanCardJobs(doc);
@@ -4413,39 +5566,62 @@
 					if (S.stopRequested) throw STOP;
 					if (job.type === "video") {
 						S.videoSeen++;
-						Panel.setTaskStat();
+						markLessonKind("video");
 						if (job.done) {
 							S.videoDone++;
-							Panel.setTaskStat();
+							Log.use(lessonKey);
 							Log.info("视频任务点已完成，跳过：" + job.title);
 							continue;
 						}
 						lessonJobCount++;
-						await processVideoWithRetry(job);
+						if (!(await processVideoWithRetry(job, lessonKey))) lessonHadError = true;
 					} else if (job.type === "answer") {
 						S.answerSeen++;
-						Panel.setAnswerStat();
+						markLessonKind("answer");
 						if (job.done) {
 							S.answerDone++;
-							Panel.setAnswerStat();
+							Log.use(lessonKey);
 							Log.info("答题任务点已完成，跳过：" + job.title);
 							continue;
 						}
+						if (!answerEnabled) {
+							Log.use(lessonKey);
+							Log.skip(
+								"跳过答题任务点「" +
+									job.title +
+									"」（" +
+									(!ansCfg.enabled ? "自动答题已关闭" : "LLM 未配置") +
+									"）",
+							);
+							continue;
+						}
 						lessonJobCount++;
-						await processAnswerWithRetry(job);
+						if (!(await processAnswerWithRetry(job, lessonKey))) lessonHadError = true;
 					} else {
+						Log.use(lessonKey);
 						Log.skip("跳过其他任务点「" + job.title + "」（类型：" + job.type + "）");
 					}
 				}
 			}
 
+			Log.use(lessonKey);
 			if (!lessonJobCount) Log.skip("当前课时不包含待处理的任务点，跳过");
 			Log.info("课时处理完成，准备进入下一个课时");
+			Log.meta(
+				null,
+				lessonHadError ? "有异常" : lessonJobCount ? "已完成" : "已跳过",
+				lessonHadError ? "err" : lessonJobCount ? "ok" : "",
+			);
 		}
 
 		// ---- FINISHED ----
+		restoreSiteAutoNext();
+		// 正常跑完：清除续跑标记，避免下次打开学习页又自动开始
+		store.set("running", false);
 		Panel.setStatus("已完成");
 		Panel.setTask("全部完成");
+		Log.useSystem();
+		if (skippedLessons) Log.skip("跳过 " + skippedLessons + " 个已全部完成的课时");
 		Log.info(
 			"课程处理完毕：视频任务点 " +
 				S.videoDone +
@@ -4477,6 +5653,7 @@
 				})
 				.then(() => {
 					S.running = false;
+					restoreSiteAutoNext();
 				});
 		},
 		stop() {
@@ -4502,6 +5679,9 @@
 				}
 			});
 			S.observers = [];
+			// 停止后不再让视频继续在后台播放，并恢复站点自动连播设置
+			pauseCourseVideos();
+			restoreSiteAutoNext();
 			// 清理离屏渲染容器中的残留节点（面板保留）
 			const rh = document.getElementById("cxap-render-host");
 			if (rh) rh.innerHTML = "";
@@ -4520,14 +5700,14 @@
 
 	function main() {
 		Panel.ensure();
-		const ver = (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || "0.2.0";
+		const ver = (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || "0.4.0";
 		Log.useSystem();
 		Log.info("脚本已加载（v" + ver + "）｜点击「开始刷课」启动");
 		const llmCfg = store.config("llm", LLM_DEFAULTS);
 		if (llmCfg.apiKey && llmCfg.model) {
 			Log.info("自动答题已就绪（模型：" + llmCfg.model + "）");
 		} else {
-			Log.warn("自动答题未配置：点击面板「模型」行的「配置…」填写 Base URL / API Key / 多模态模型");
+			Log.warn("自动答题未配置：点击面板左上角的齿轮按钮打开「高级设置」，填写 Base URL / API Key / 多模态模型");
 		}
 		// 请求环境自检：无 GM 时无法绕过 CORS / 混合内容，提前明确告知，避免答题时才失败
 		if (!LLM.hasGM()) {
@@ -4572,8 +5752,18 @@
 				CFG,
 				LLM_DEFAULTS,
 				ANSWER_DEFAULTS,
+				VIDEO_DEFAULTS,
 				scanCardJobs,
 				scanLessons,
+				gotoLesson,
+				softNavigateLesson,
+				pauseCourseVideos,
+				Video: {
+					getVideoPlayer,
+					readRateOptions,
+					createSpeedController,
+					handleVideoTask,
+				},
 			};
 		} catch (e) {
 			/* noop */

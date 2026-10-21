@@ -2,14 +2,14 @@
 
 function main() {
 	Panel.ensure();
-	const ver = (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || "0.2.0";
+	const ver = (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || "0.4.0";
 	Log.useSystem();
 	Log.info("脚本已加载（v" + ver + "）｜点击「开始刷课」启动");
 	const llmCfg = store.config("llm", LLM_DEFAULTS);
 	if (llmCfg.apiKey && llmCfg.model) {
 		Log.info("自动答题已就绪（模型：" + llmCfg.model + "）");
 	} else {
-		Log.warn("自动答题未配置：点击面板「模型」行的「配置…」填写 Base URL / API Key / 多模态模型");
+		Log.warn("自动答题未配置：点击面板左上角的齿轮按钮打开「高级设置」，填写 Base URL / API Key / 多模态模型");
 	}
 	// 请求环境自检：无 GM 时无法绕过 CORS / 混合内容，提前明确告知，避免答题时才失败
 	if (!LLM.hasGM()) {
@@ -54,8 +54,18 @@ function main() {
 			CFG,
 			LLM_DEFAULTS,
 			ANSWER_DEFAULTS,
+			VIDEO_DEFAULTS,
 			scanCardJobs,
 			scanLessons,
+			gotoLesson,
+			softNavigateLesson,
+			pauseCourseVideos,
+			Video: {
+				getVideoPlayer,
+				readRateOptions,
+				createSpeedController,
+				handleVideoTask,
+			},
 		};
 	} catch (e) {
 		/* noop */

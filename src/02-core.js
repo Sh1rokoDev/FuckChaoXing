@@ -84,8 +84,8 @@ const Log = {
 		Panel.ensureCard("sys", { kind: "sys", title: "系统信息" });
 	},
 	/** 更新当前卡片标题与徽标 */
-	meta(title, badge, badgeCls) {
-		Panel.cardMeta(this._cur, { title, badge, badgeCls });
+	meta(title, badge, badgeCls, kind) {
+		Panel.cardMeta(this._cur, { title, badge, badgeCls, kind });
 	},
 
 	push(level, msg) {
